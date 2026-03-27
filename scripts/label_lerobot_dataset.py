@@ -5,6 +5,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,11 +17,12 @@ LATENT_FORMAT_IDS = "ids"
 LATENT_FORMAT_CONTINUOUS = "continuous"
 LATENT_FORMAT_CODEBOOK_VECTORS = "codebook_vectors"
 DISMO_FORMAT_MOTION = "motion_embeddings"
+_PROGRESS_LOG_EVERY_BATCHES = 100
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--policy-type", required=True, choices=["lam", "dismo"])
+    parser.add_argument("--policy-type", required=True, choices=["lapa_lam", "rlfv_lam", "dismo"])
     parser.add_argument("--policy-path", required=True, help="Checkpoint dir for Policy.from_pretrained().")
     parser.add_argument("--dataset-repo-id", required=True, help="LeRobot dataset repo_id.")
     parser.add_argument("--dataset-root", default=None, help="Optional local dataset root.")
@@ -101,8 +103,10 @@ def _workspace_code_dir() -> Path:
 
 def _default_plugin_src(policy_type: str) -> Path:
     base = _workspace_code_dir()
-    if policy_type == "lam":
+    if policy_type == "lapa_lam":
         return base / "lerobot_policy_lapa_lam" / "src"
+    if policy_type == "rlfv_lam":
+        return base / "lerobot_policy_rlfv_lam" / "src"
     if policy_type == "dismo":
         return base / "lerobot_policy_dismo" / "src"
     raise ValueError(f"Unsupported policy_type={policy_type!r}")
@@ -132,10 +136,14 @@ def _bootstrap_imports(policy_type: str, plugin_src_paths: list[str]) -> dict[st
         "add_features": add_features,
     }
 
-    if policy_type == "lam":
-        from lerobot_policy_lam.modeling_lam import LAMPolicy
+    if policy_type == "lapa_lam":
+        from lerobot_policy_lapa_lam.modeling_lam import LAMPolicy
 
         modules["Policy"] = LAMPolicy
+    elif policy_type == "rlfv_lam":
+        from lerobot_policy_rlfv_lam.modeling_lam import RLFVLAMPolicy
+
+        modules["Policy"] = RLFVLAMPolicy
     elif policy_type == "dismo":
         from lerobot_policy_dismo.modeling_dismo import DisMoPolicy
 
@@ -202,17 +210,33 @@ def _load_frame_pair(dataset: Any, first_idx: int, second_idx: int, camera_key: 
 
 
 def _build_valid_pairs(dataset: Any, future_frames: int) -> tuple[np.ndarray, np.ndarray]:
-    dataset._ensure_hf_dataset_loaded()
-    episode_indices = np.asarray(dataset.hf_dataset["episode_index"], dtype=np.int64)
-    num_frames = len(episode_indices)
+    num_frames = int(dataset.num_frames)
     valid_mask = np.zeros(num_frames, dtype=np.int64)
     pair_targets = np.full(num_frames, -1, dtype=np.int64)
-    for idx in range(num_frames - future_frames):
-        target_idx = idx + future_frames
-        if episode_indices[idx] != episode_indices[target_idx]:
-            continue
-        valid_mask[idx] = 1
-        pair_targets[idx] = target_idx
+
+    episode_lengths_by_index = {
+        int(ep_idx): int(length)
+        for ep_idx, length in zip(dataset.meta.episodes["episode_index"], dataset.meta.episodes["length"], strict=True)
+    }
+    selected_episodes = (
+        [int(ep_idx) for ep_idx in dataset.meta.episodes["episode_index"]]
+        if dataset.episodes is None
+        else sorted({int(ep_idx) for ep_idx in dataset.episodes})
+    )
+
+    offset = 0
+    for episode_index in selected_episodes:
+        episode_length = episode_lengths_by_index[episode_index]
+        valid_count = max(episode_length - future_frames, 0)
+        if valid_count > 0:
+            starts = offset + np.arange(valid_count, dtype=np.int64)
+            valid_mask[starts] = 1
+            pair_targets[starts] = starts + future_frames
+        offset += episode_length
+
+    if offset != num_frames:
+        raise ValueError(f"Episode-length reconstruction mismatch: expected {num_frames} frames, got {offset}")
+
     return valid_mask, pair_targets
 
 
@@ -246,8 +270,10 @@ def _run_lam_labeling(dataset: Any, policy: Any, args: argparse.Namespace, camer
 
     if len(valid_indices) > 0:
         policy.eval()
+        total_batches = (len(valid_indices) + args.batch_size - 1) // args.batch_size
+        start_time = time.perf_counter()
         with torch.inference_mode():
-            for start in range(0, len(valid_indices), args.batch_size):
+            for batch_idx, start in enumerate(range(0, len(valid_indices), args.batch_size), start=1):
                 batch_indices = valid_indices[start : start + args.batch_size]
                 frame_pairs = [
                     _load_frame_pair(dataset, int(frame_idx), int(pair_targets[frame_idx]), camera_key)
@@ -259,10 +285,26 @@ def _run_lam_labeling(dataset: Any, policy: Any, args: argparse.Namespace, camer
                     raise RuntimeError("Unexpected invalid frame pair in LAM labeling batch.")
                 latent_values = _extract_lam_latents(policy, video, args.latent_format)
                 labels[batch_indices] = latent_values.detach().cpu().numpy().astype(latent_dtype, copy=False)
+                if batch_idx % _PROGRESS_LOG_EVERY_BATCHES == 0 or batch_idx == total_batches:
+                    elapsed_s = max(time.perf_counter() - start_time, 1e-9)
+                    processed = min(start + len(batch_indices), len(valid_indices))
+                    rate = processed / elapsed_s
+                    remaining = len(valid_indices) - processed
+                    eta_s = remaining / max(rate, 1e-9)
+                    logging.info(
+                        "LAM labeling progress: %d/%d valid pairs (%.1f%%), batch %d/%d, %.1f pairs/s, ETA %.1f min",
+                        processed,
+                        len(valid_indices),
+                        100.0 * processed / len(valid_indices),
+                        batch_idx,
+                        total_batches,
+                        rate,
+                        eta_s / 60.0,
+                    )
 
     feature_info = {"dtype": feature_dtype, "shape": feature_shape, "names": None}
     manifest = {
-        "policy_type": "lam",
+        "policy_type": args.policy_type,
         "latent_format": args.latent_format,
         "future_frames": future_frames,
         "camera_key": camera_key,
@@ -318,13 +360,31 @@ def _run_dismo_labeling(dataset: Any, policy: Any, args: argparse.Namespace, cam
 
     if len(valid_indices) > 0:
         policy.eval()
+        total_batches = (len(valid_indices) + args.batch_size - 1) // args.batch_size
+        start_time = time.perf_counter()
         with torch.inference_mode():
-            for start in range(0, len(valid_indices), args.batch_size):
+            for batch_idx, start in enumerate(range(0, len(valid_indices), args.batch_size), start=1):
                 batch_indices = valid_indices[start : start + args.batch_size]
                 clips = [_load_clip(dataset, int(frame_idx), clip_length, camera_key) for frame_idx in batch_indices]
                 clip_batch = torch.stack(clips, dim=0)
                 embeddings = _extract_dismo_motion(policy, clip_batch, camera_key, lookahead=lookahead)
                 labels[batch_indices] = embeddings.detach().cpu().numpy().astype(np.float32, copy=False)
+                if batch_idx % _PROGRESS_LOG_EVERY_BATCHES == 0 or batch_idx == total_batches:
+                    elapsed_s = max(time.perf_counter() - start_time, 1e-9)
+                    processed = min(start + len(batch_indices), len(valid_indices))
+                    rate = processed / elapsed_s
+                    remaining = len(valid_indices) - processed
+                    eta_s = remaining / max(rate, 1e-9)
+                    logging.info(
+                        "DISMO labeling progress: %d/%d valid clips (%.1f%%), batch %d/%d, %.1f clips/s, ETA %.1f min",
+                        processed,
+                        len(valid_indices),
+                        100.0 * processed / len(valid_indices),
+                        batch_idx,
+                        total_batches,
+                        rate,
+                        eta_s / 60.0,
+                    )
 
     feature_info = {"dtype": "float32", "shape": (embedding_dim,), "names": None}
     manifest = {
@@ -368,7 +428,7 @@ def main() -> None:
     if hasattr(policy.config, "camera_key"):
         policy.config.camera_key = camera_key
 
-    if args.policy_type == "lam":
+    if args.policy_type in {"lapa_lam", "rlfv_lam"}:
         labels, valid_mask, feature_info, manifest = _run_lam_labeling(dataset, policy, args, camera_key)
     elif args.policy_type == "dismo":
         labels, valid_mask, feature_info, manifest = _run_dismo_labeling(dataset, policy, args, camera_key)

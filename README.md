@@ -9,7 +9,7 @@ Current scope:
 
 Initial supported labelers:
 
-- `lam` via `lerobot_policy_lapa_lam`
+- `lapa_lam` via `lerobot_policy_lapa_lam`
 - `dismo` via `lerobot_policy_dismo`
 
 The main entrypoint is:
@@ -18,7 +18,21 @@ The main entrypoint is:
 python scripts/label_lerobot_dataset.py --help
 ```
 
+For the newer DataLoader-based path:
+
+```bash
+python scripts/label_lerobot_dataset_v2.py --help
+```
+
+For the strict multi-format exporter:
+
+```bash
+python scripts/label_lerobot_dataset_v3.py --help
+```
+
 Notes:
 
-- `lam --latent-format ids` is the directly compatible mode for `latent_smolvla`
+- `lapa_lam --latent-format ids` is the directly compatible mode for `latent_smolvla`
+- `label_lerobot_dataset_v3.py` writes all three LAM outputs at once:
+  `prefix.codebook_ids`, `prefix.continuous`, `prefix.codebook_vectors`
 - `dismo` currently exports continuous motion embeddings, which are useful for analysis or future consumers but are not directly compatible with the current cross-entropy latent-label path

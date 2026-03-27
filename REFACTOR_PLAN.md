@@ -2,7 +2,7 @@
 
 ## Goal
 
-Turn `lerobot_latent_actions` into a generic latent-label export tool rather than a script with policy-specific `lam` / `dismo` branches.
+Turn `lerobot_latent_actions` into a generic latent-label export tool rather than a script with policy-specific `lapa_lam` / `dismo` branches.
 
 The desired end state is:
 
@@ -24,9 +24,25 @@ This keeps temporal logic and latent-format logic inside each labeling policy ra
 - standalone latent policy exists:
   - [../lerobot_policy_latent_smolvla](/mnt/data/workspace/code/lerobot_policy_latent_smolvla)
 - LA-PA now has a public latent export method:
-  - [../lerobot_policy_lapa_lam/src/lerobot_policy_lam/modeling_lam.py](/mnt/data/workspace/code/lerobot_policy_lapa_lam/src/lerobot_policy_lam/modeling_lam.py)
+  - [../lerobot_policy_lapa_lam/src/lerobot_policy_lapa_lam/modeling_lam.py](/mnt/data/workspace/code/lerobot_policy_lapa_lam/src/lerobot_policy_lapa_lam/modeling_lam.py)
 - ID relabeling works end to end
 - `latent_smolvla` CE smoke works end to end on relabeled LIBERO data
+- vector relabeling now also works end to end for LA-PA codebook vectors
+- `latent_smolvla` vector-diffusion smoke works end to end on relabeled LIBERO data
+
+### Important naming split
+
+Two axes must stay separate:
+
+- label export format from the labeling policy:
+  - `ids`
+  - `continuous`
+  - `codebook_vectors`
+- training objective inside `latent_smolvla`:
+  - `latent_head_mode=index_cross_entropy`
+  - `latent_head_mode=vector_diffusion`
+
+This avoids mixing representation choice with training objective.
 
 ### What is still wrong architecturally
 
@@ -165,7 +181,7 @@ Each labeling policy should own:
 
 This should wrap the already-added public latent extraction path in:
 
-- [../lerobot_policy_lapa_lam/src/lerobot_policy_lam/modeling_lam.py](/mnt/data/workspace/code/lerobot_policy_lapa_lam/src/lerobot_policy_lam/modeling_lam.py)
+- [../lerobot_policy_lapa_lam/src/lerobot_policy_lapa_lam/modeling_lam.py](/mnt/data/workspace/code/lerobot_policy_lapa_lam/src/lerobot_policy_lapa_lam/modeling_lam.py)
 
 ### DISMO
 
@@ -211,6 +227,16 @@ Unlabeled samples should be written as:
 - `valid_mask = 0`
 
 This matches the current `add_features(...)` implementation better than trying to rewrite filtered subsets.
+
+### Current `add_features(...)` limitation
+
+The current LeRobot write-back path can handle vector features, but it still assumes the original source parquet layout.
+
+That means:
+
+- vector features like `(N, 1, 32)` are now supported after the parquet assignment fix
+- but write-back should still use full-length arrays aligned with the source dataset
+- filtered dataset objects are still the wrong input for the current `add_features(...)` path
 
 ### Default feature names
 
@@ -272,7 +298,7 @@ So for now, the safest write-back path is:
 
 1. add shared latent-export interface types in this repo
 2. move LA-PA fully onto that interface
-3. refactor the script to remove `lam` / `dismo` branching
+3. refactor the script to remove `lapa_lam` / `dismo` branching
 4. revalidate the working ID path
 5. add DISMO implementation
 6. finish vector-label dataset generation
