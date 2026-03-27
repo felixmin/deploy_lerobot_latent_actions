@@ -1,38 +1,79 @@
 # lerobot_latent_actions
 
-Standalone utilities for generating offline latent-action labels for LeRobot datasets.
+Minimal offline latent-label export for LeRobot datasets.
 
-Current scope:
-
-- relabel an existing LeRobot dataset with labels produced by an offline policy
-- write those labels back as new dataset features using LeRobot `add_features`
-
-Initial supported labelers:
-
-- `lapa_lam` via `lerobot_policy_lapa_lam`
-- `dismo` via `lerobot_policy_dismo`
-
-The main entrypoint is:
+The repo has one supported entrypoint:
 
 ```bash
 python scripts/label_lerobot_dataset.py --help
 ```
 
-For the newer DataLoader-based path:
+## Design
+
+- one script
+- no numbered exporter versions
+- no policy-type branches in the script
+- policy defaults come from `--policy.path`
+- any policy field can be overridden with `--policy.<field>=...`
+
+The exporter expects the loaded policy to implement two methods:
+
+- `prepare_latent_export(dataset_meta, *, representation)`
+- `export_latent_labels(batch, *, representation)`
+
+## Standard representations
+
+Quantized latent policies should expose:
+
+- `codebook_id_latents`
+- `codebook_vector_latents`
+- `continuous_vector_latents`
+
+`continuous_vector_latents` is the generic continuous latent-vector name. For quantized policies it is the pre-quantization latent vector. Policies without a quantizer, such as DisMo, can still expose it for their continuous latent embeddings.
+
+## Policy loading
+
+The script uses normal LeRobot config loading and plugin discovery.
+
+Make sure the intended LeRobot package is on `PYTHONPATH` or installed in the active environment. In this workspace that usually means:
 
 ```bash
-python scripts/label_lerobot_dataset_v2.py --help
+PYTHONPATH=/mnt/data/workspace/code/lerobot/src
 ```
 
-For the strict multi-format exporter:
+If the policy package is installed in the environment, `--policy.path` is enough.
+
+If you are developing a local policy repo without installing it, make the package importable and tell the parser to load it:
 
 ```bash
-python scripts/label_lerobot_dataset_v3.py --help
+PYTHONPATH=/mnt/data/workspace/code/lerobot/src:/path/to/lerobot_policy_lapa_lam/src \
+python scripts/label_lerobot_dataset.py \
+  --policy.path=/path/to/checkpoint/pretrained_model \
+  --policy.discover_packages_path=lerobot_policy_lapa_lam \
+  ...
 ```
 
-Notes:
+## Example
 
-- `lapa_lam --latent-format ids` is the directly compatible mode for `latent_smolvla`
-- `label_lerobot_dataset_v3.py` writes all three LAM outputs at once:
-  `prefix.codebook_ids`, `prefix.continuous`, `prefix.codebook_vectors`
-- `dismo` currently exports continuous motion embeddings, which are useful for analysis or future consumers but are not directly compatible with the current cross-entropy latent-label path
+```bash
+PYTHONPATH=/mnt/data/workspace/code/lerobot/src:/mnt/data/workspace/code/lerobot_policy_lapa_lam/src \
+HF_LEROBOT_HOME=/mnt/data/workspace/runs_root/cache/huggingface/lerobot \
+python scripts/label_lerobot_dataset.py \
+  --policy.path=/mnt/data/workspace/runs_root/runs_lerobot/outputs/train/2026-03-27/00-34-07_lapa_lam/checkpoints/120000/pretrained_model \
+  --policy.discover_packages_path=lerobot_policy_lapa_lam \
+  --dataset_repo_id=HuggingFaceVLA/libero \
+  --dataset_root=/mnt/data/workspace/runs_root/cache/huggingface/lerobot/HuggingFaceVLA/libero \
+  --output_dir=/mnt/data/workspace/runs_root/runs_lerobot/latent_labels/libero_lapa_lam_120000_ids \
+  --latent_representation=codebook_id_latents \
+  --policy.camera_key=observation.images.image \
+  --policy.future_frames=10 \
+  --batch_size=32 \
+  --num_workers=8
+```
+
+This writes:
+
+- `latent_labels`
+- `latent_supervised`
+
+For token-style supervision, use `codebook_id_latents`.
