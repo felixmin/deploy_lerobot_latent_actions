@@ -17,11 +17,8 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.dataset_tools import add_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_policy
-from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.utils import init_logging
 
-
-DEFAULT_LATENT_REPRESENTATION = "codebook_id_latents"
 PROGRESS_LOG_EVERY_BATCHES = 100
 
 
@@ -33,9 +30,10 @@ class LatentExportConfig:
     episodes: list[int] | None = None
     output_dir: Path | None = None
     output_repo_id: str | None = None
-    latent_representation: str = DEFAULT_LATENT_REPRESENTATION
-    feature_name: str = "latent_labels"
-    valid_feature_name: str = "latent_supervised"
+    # Use a top-level namespace such as `latent_labels` or `lam_lapa`.
+    # Avoid observation.* because dataset delta-timestamp expansion treats those
+    # keys like normal observations and adds extra temporal axes.
+    feature_prefix: str = "latent_labels"
     batch_size: int = 32
     num_workers: int = 8
     force: bool = False
@@ -46,7 +44,11 @@ class LatentExportConfig:
         if not policy_path:
             raise ValueError("Policy is not configured. Please specify a checkpoint with `--policy.path`.")
 
-        cli_overrides = parser.get_cli_overrides("policy")
+        cli_overrides = [
+            arg
+            for arg in (parser.get_cli_overrides("policy") or [])
+            if not arg.startswith("--discover_packages_path=")
+        ]
         self.policy = PreTrainedConfig.from_pretrained(
             policy_path,
             local_files_only=True,
@@ -64,8 +66,11 @@ class LatentExportConfig:
             raise ValueError(f"num_workers must be >= 0, got {self.num_workers}.")
         if self.max_valid_samples is not None and self.max_valid_samples < 1:
             raise ValueError(f"max_valid_samples must be >= 1, got {self.max_valid_samples}.")
-        if self.feature_name == self.valid_feature_name:
-            raise ValueError("feature_name and valid_feature_name must differ.")
+        if self.feature_prefix.startswith("observation."):
+            raise ValueError(
+                "feature_prefix must not use observation.*. "
+                "Use a top-level namespace such as `latent_labels` or `lam_lapa`."
+            )
         if self.output_repo_id is None:
             self.output_repo_id = f"{self.dataset_repo_id}_latent_labeled"
 
@@ -95,34 +100,52 @@ def _get_required_method(obj: Any, method_name: str) -> Any:
 def _normalize_export_plan(plan: Any) -> dict[str, Any]:
     if not isinstance(plan, dict):
         raise TypeError(f"prepare_latent_export() must return a dict, got {type(plan)}.")
-    required_keys = {"delta_timestamps", "shape", "dtype", "invalid_fill_value"}
+    required_keys = {"delta_timestamps", "representations"}
     missing = required_keys.difference(plan)
     if missing:
         raise KeyError(f"prepare_latent_export() is missing keys: {sorted(missing)}")
 
-    shape = tuple(int(dim) for dim in plan["shape"])
-    dtype = np.dtype(plan["dtype"])
+    representations = {}
+    for name, spec in plan["representations"].items():
+        representations[name] = {
+            "shape": tuple(int(dim) for dim in spec["shape"]),
+            "dtype": np.dtype(spec["dtype"]),
+            "invalid_fill_value": spec["invalid_fill_value"],
+        }
     return {
         "delta_timestamps": plan["delta_timestamps"],
-        "shape": shape,
-        "dtype": dtype,
-        "invalid_fill_value": plan["invalid_fill_value"],
+        "representations": representations,
     }
 
 
-def _normalize_export_batch(batch_out: Any) -> dict[str, torch.Tensor]:
+def _normalize_export_batch(batch_out: Any) -> dict[str, Any]:
     if not isinstance(batch_out, dict):
         raise TypeError(f"export_latent_labels() must return a dict, got {type(batch_out)}.")
-    if "labels" not in batch_out or "valid_mask" not in batch_out:
-        raise KeyError("export_latent_labels() must return `labels` and `valid_mask`.")
+    if "labels_by_name" not in batch_out or "valid_mask" not in batch_out:
+        raise KeyError("export_latent_labels() must return `labels_by_name` and `valid_mask`.")
 
-    labels = batch_out["labels"]
     valid_mask = batch_out["valid_mask"]
-    if not torch.is_tensor(labels):
-        labels = torch.as_tensor(labels)
     if not torch.is_tensor(valid_mask):
         valid_mask = torch.as_tensor(valid_mask)
-    return {"labels": labels, "valid_mask": valid_mask}
+
+    labels_by_name = {}
+    for name, labels in batch_out["labels_by_name"].items():
+        if not torch.is_tensor(labels):
+            labels = torch.as_tensor(labels)
+        labels_by_name[name] = labels
+    return {"labels_by_name": labels_by_name, "valid_mask": valid_mask}
+
+
+def _format_feature_values(values: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+    if len(shape) == 0:
+        return values
+    if len(shape) == 1 and shape[0] == 1:
+        return values.reshape(-1, 1)
+
+    formatted = np.empty((values.shape[0],), dtype=object)
+    for idx in range(values.shape[0]):
+        formatted[idx] = values[idx]
+    return formatted
 
 
 def export_latent_dataset(cfg: LatentExportConfig) -> None:
@@ -139,16 +162,12 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
     output_dir = cfg.output_dir.resolve()
     _prepare_output_dir(output_dir, cfg.force)
 
-    register_third_party_plugins()
-
     source_dataset = LeRobotDataset(cfg.dataset_repo_id, root=cfg.dataset_root)
     policy = make_policy(cfg.policy, ds_meta=source_dataset.meta)
     prepare_latent_export = _get_required_method(policy, "prepare_latent_export")
     export_latent_labels = _get_required_method(policy, "export_latent_labels")
 
-    plan = _normalize_export_plan(
-        prepare_latent_export(source_dataset.meta, representation=cfg.latent_representation)
-    )
+    plan = _normalize_export_plan(prepare_latent_export(source_dataset.meta))
 
     label_dataset = LeRobotDataset(
         cfg.dataset_repo_id,
@@ -167,13 +186,19 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
     )
 
     total_frames = int(source_dataset.meta.total_frames)
-    labels = np.full(
-        (total_frames, *plan["shape"]),
-        plan["invalid_fill_value"],
-        dtype=plan["dtype"],
-    )
+    label_arrays = {
+        name: np.full(
+            (total_frames, *spec["shape"]),
+            spec["invalid_fill_value"],
+            dtype=spec["dtype"],
+        )
+        for name, spec in plan["representations"].items()
+    }
     valid_supervision = np.zeros((total_frames, 1), dtype=np.int64)
-    feature_info = {"dtype": plan["dtype"].name, "shape": plan["shape"], "names": None}
+    feature_infos = {
+        name: {"dtype": spec["dtype"].name, "shape": spec["shape"], "names": None}
+        for name, spec in plan["representations"].items()
+    }
 
     logging.info(
         "Label export setup:\n%s",
@@ -184,9 +209,8 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
                 "dataset_repo_id": cfg.dataset_repo_id,
                 "dataset_root": cfg.dataset_root,
                 "episodes": cfg.episodes,
-                "latent_representation": cfg.latent_representation,
-                "feature_name": cfg.feature_name,
-                "valid_feature_name": cfg.valid_feature_name,
+                "feature_prefix": cfg.feature_prefix,
+                "representation_names": list(plan["representations"]),
                 "batch_size": cfg.batch_size,
                 "num_workers": cfg.num_workers,
                 "delta_timestamps": plan["delta_timestamps"],
@@ -204,9 +228,7 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
                 row_idx = torch.as_tensor(row_idx)
             row_idx_np = row_idx.detach().cpu().numpy().astype(np.int64, copy=False)
 
-            batch_out = _normalize_export_batch(
-                export_latent_labels(batch, representation=cfg.latent_representation)
-            )
+            batch_out = _normalize_export_batch(export_latent_labels(batch))
             valid_mask = batch_out["valid_mask"]
             if valid_mask.ndim != 1 or valid_mask.shape[0] != row_idx.shape[0]:
                 raise ValueError(
@@ -217,12 +239,6 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
             valid_count = int(valid_mask_np.sum())
 
             if valid_count:
-                labels_tensor = batch_out["labels"]
-                if labels_tensor.shape[0] != valid_count:
-                    raise ValueError(
-                        "export_latent_labels() returned a labels batch that does not match the number of valid rows."
-                    )
-
                 valid_rows = row_idx_np[valid_mask_np]
                 if cfg.max_valid_samples is not None:
                     remaining = cfg.max_valid_samples - written
@@ -230,10 +246,19 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
                         break
                     if valid_count > remaining:
                         valid_rows = valid_rows[:remaining]
-                        labels_tensor = labels_tensor[:remaining]
                         valid_count = remaining
 
-                labels[valid_rows] = labels_tensor.detach().cpu().numpy().astype(plan["dtype"], copy=False)
+                for name, labels_tensor in batch_out["labels_by_name"].items():
+                    if labels_tensor.shape[0] != int(valid_mask_np.sum()):
+                        raise ValueError(
+                            f"export_latent_labels() returned {name!r} with a batch size that does not match the number of valid rows."
+                        )
+                    if cfg.max_valid_samples is not None and labels_tensor.shape[0] > valid_count:
+                        labels_tensor = labels_tensor[:valid_count]
+                    label_arrays[name][valid_rows] = labels_tensor.detach().cpu().numpy().astype(
+                        plan["representations"][name]["dtype"],
+                        copy=False,
+                    )
                 valid_supervision[valid_rows, 0] = 1
                 written += valid_count
 
@@ -255,8 +280,14 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
     relabeled_dataset = add_features(
         dataset=source_dataset,
         features={
-            cfg.feature_name: (labels, feature_info),
-            cfg.valid_feature_name: (
+            **{
+                f"{cfg.feature_prefix}.{name}": (
+                    _format_feature_values(label_arrays[name], feature_infos[name]["shape"]),
+                    feature_infos[name],
+                )
+                for name in plan["representations"]
+            },
+            f"{cfg.feature_prefix}.valid": (
                 valid_supervision,
                 {"dtype": "int64", "shape": (1,), "names": None},
             ),
@@ -273,9 +304,11 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
         "episodes": cfg.episodes,
         "output_repo_id": cfg.output_repo_id,
         "output_dir": str(output_dir),
-        "latent_representation": cfg.latent_representation,
-        "feature_name": cfg.feature_name,
-        "valid_feature_name": cfg.valid_feature_name,
+        "feature_prefix": cfg.feature_prefix,
+        "feature_names": {
+            name: f"{cfg.feature_prefix}.{name}" for name in plan["representations"]
+        },
+        "valid_feature_name": f"{cfg.feature_prefix}.valid",
         "delta_timestamps": plan["delta_timestamps"],
         "num_valid_labels": int(valid_supervision.sum()),
     }
