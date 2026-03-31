@@ -1,4 +1,4 @@
-# lerobot_latent_actions
+# deploy_lerobot_latent_actions
 
 Utilities for exporting latent labels onto LeRobot datasets.
 
