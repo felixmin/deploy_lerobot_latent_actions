@@ -17,6 +17,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.dataset_tools import add_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_policy
+from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.utils import init_logging
 
 PROGRESS_LOG_EVERY_BATCHES = 100
@@ -321,6 +322,7 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
 
 @parser.wrap()
 def main(cfg: LatentExportConfig) -> None:
+    register_third_party_plugins()
     init_logging()
     export_latent_dataset(cfg)
 

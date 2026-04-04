@@ -43,6 +43,8 @@ After training, pick the checkpoint directory:
 
 ## 3. Label The Dataset
 
+Use `latent_labels` as the feature prefix unless you have a strong reason to expose teacher-specific naming in the dataset schema.
+
 ```bash
 PYTHONPATH=/mnt/data/workspace/code/lerobot/src:/mnt/data/workspace/code/lerobot_policy_lam_lapa/src \
 HF_LEROBOT_HOME=/mnt/data/workspace/runs_root/cache/huggingface/lerobot \
@@ -85,13 +87,7 @@ lerobot-train \
   --policy.latent_vector_dim=128
 ```
 
-## 5. Why This Key Layout Works
-
-The important part is that the latent labels live under a top-level prefix such as `latent_labels.*`.
-
-That avoids the `observation.*` path, which can introduce unintended observation-history stacking.
-
-`latent_smolvla` preserves its configured latent supervision keys explicitly during preprocessing, so it can still access these top-level features at training time.
+## 5. Key Split
 
 The split is:
 - labeled dataset:

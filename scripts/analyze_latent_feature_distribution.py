@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 
@@ -15,15 +16,25 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
-from sklearn.metrics import mutual_info_score, normalized_mutual_info_score, r2_score
+from sklearn.metrics import mean_squared_error, mutual_info_score, normalized_mutual_info_score, r2_score
 from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+
+def parse_hidden_dims(raw: str) -> tuple[int, ...]:
+    dims = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    if not dims or any(dim <= 0 for dim in dims):
+        raise argparse.ArgumentTypeError(
+            "--probe-mlp-hidden-dims must be a comma-separated list of positive integers."
+        )
+    return dims
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze latent feature distributions for a labeled LeRobot dataset.")
     parser.add_argument("--dataset-root", type=Path, required=True, help="Root of the labeled dataset.")
-    parser.add_argument("--feature-prefix", type=str, required=True, help="Feature prefix, e.g. lapa_lam_120000.")
+    parser.add_argument("--feature-prefix", type=str, required=True, help="Feature prefix, e.g. latent_labels.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory where plots and tables will be written.")
     parser.add_argument(
         "--top-k-sequences",
@@ -74,20 +85,62 @@ def parse_args() -> argparse.Namespace:
         help="Held-out fraction for action probes.",
     )
     parser.add_argument(
+        "--probe-model",
+        choices=("ridge", "mlp", "both"),
+        default="ridge",
+        help="Probe backend used for action prediction.",
+    )
+    parser.add_argument(
+        "--probe-split",
+        choices=("row", "episode"),
+        default="row",
+        help="How to split data into train/test for the action probes.",
+    )
+    parser.add_argument(
         "--ridge-alpha",
         type=float,
         default=1.0,
         help="Ridge regularization used for linear action probes.",
     )
+    parser.add_argument(
+        "--probe-mlp-hidden-dims",
+        type=parse_hidden_dims,
+        default=(512, 256),
+        help="Comma-separated hidden sizes for the MLP action probe.",
+    )
+    parser.add_argument(
+        "--probe-mlp-alpha",
+        type=float,
+        default=1e-4,
+        help="L2 regularization strength for the MLP action probe.",
+    )
+    parser.add_argument(
+        "--probe-mlp-max-iter",
+        type=int,
+        default=200,
+        help="Maximum optimization steps for the MLP action probe.",
+    )
+    parser.add_argument(
+        "--probe-mlp-early-stopping",
+        type=lambda raw: raw.lower() in {"1", "true", "yes", "on"},
+        default=True,
+        help="Whether the MLP action probe should use validation-based early stopping.",
+    )
+    parser.add_argument(
+        "--probe-mlp-n-iter-no-change",
+        type=int,
+        default=10,
+        help="Patience used by the MLP action probe when early stopping is enabled.",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     return parser.parse_args()
 
 
-def save_json(path: Path, payload: dict) -> None:
+def save_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
-def load_info(dataset_root: Path) -> dict:
+def load_info(dataset_root: Path) -> dict[str, Any]:
     info_path = dataset_root / "meta" / "info.json"
     return json.loads(info_path.read_text())
 
@@ -107,7 +160,8 @@ def load_valid_counts(dataset: ds.Dataset, valid_col: str) -> dict[str, int]:
 def load_ids(dataset: ds.Dataset, ids_col: str, valid_col: str) -> np.ndarray:
     table = dataset.to_table(columns=[ids_col], filter=ds.field(valid_col) == 1)
     obj = table[ids_col].to_numpy(zero_copy_only=False)
-    return np.stack(obj).astype(np.int64, copy=False)
+    ids = np.stack(obj).astype(np.int64, copy=False)
+    return ensure_2d_rows(ids)
 
 
 def load_float_array(dataset: ds.Dataset, column_name: str, valid_col: str) -> np.ndarray:
@@ -124,7 +178,26 @@ def load_action_context(dataset: ds.Dataset, action_col: str, valid_col: str) ->
     return actions, valid, episode_index
 
 
+def ensure_2d_rows(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        return arr[:, None]
+    if arr.ndim != 2:
+        raise ValueError(f"Expected a 1D or 2D row array, got shape={arr.shape}.")
+    return arr
+
+
+def ensure_slot_tensor(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr)
+    if arr.ndim == 2:
+        return arr[:, None, :]
+    if arr.ndim != 3:
+        raise ValueError(f"Expected a 2D or 3D slot tensor, got shape={arr.shape}.")
+    return arr
+
+
 def contiguous_row_view(arr_2d: np.ndarray) -> np.ndarray:
+    arr_2d = ensure_2d_rows(arr_2d)
     arr_2d = np.ascontiguousarray(arr_2d)
     dtype = np.dtype((np.void, arr_2d.dtype.itemsize * arr_2d.shape[1]))
     return arr_2d.view(dtype).reshape(-1)
@@ -152,6 +225,7 @@ def summarize_numeric(values: np.ndarray) -> dict[str, float]:
 
 
 def summarize_norms(values: np.ndarray) -> pd.DataFrame:
+    values = ensure_slot_tensor(values)
     slot_norms = np.linalg.norm(values, axis=2)
     rows = []
     for slot_idx in range(slot_norms.shape[1]):
@@ -227,6 +301,23 @@ def derive_action_targets(
         "current_action": np.concatenate(current_chunks, axis=0),
         "future_action_mean": np.concatenate(future_mean_chunks, axis=0),
     }
+
+
+def extract_valid_episode_index(valid: np.ndarray, episode_index: np.ndarray) -> np.ndarray:
+    chunks = []
+    for start, end in episode_ranges(episode_index):
+        valid_ep = valid[start:end]
+        n_valid = int(np.sum(valid_ep == 1))
+        if not np.all(valid_ep[:n_valid] == 1):
+            raise ValueError("Expected valid rows to be contiguous at the start of each episode.")
+        if not np.all(valid_ep[n_valid:] == 0):
+            raise ValueError("Expected invalid rows to be contiguous at the end of each episode.")
+        if n_valid == 0:
+            continue
+        chunks.append(episode_index[start : start + n_valid])
+    if not chunks:
+        return np.empty((0,), dtype=np.int64)
+    return np.concatenate(chunks, axis=0).astype(np.int64, copy=False)
 
 
 def quantile_bin_1d(values: np.ndarray, n_bins: int) -> tuple[np.ndarray, np.ndarray]:
@@ -324,6 +415,7 @@ def plot_value_histogram(values: np.ndarray, title: str, output_path: Path) -> N
 
 
 def plot_slot_norms(values: np.ndarray, title: str, output_path: Path) -> None:
+    values = ensure_slot_tensor(values)
     norms = np.linalg.norm(values, axis=2)
     fig, ax = plt.subplots(figsize=(9, 5))
     for slot_idx in range(norms.shape[1]):
@@ -373,6 +465,7 @@ def make_pca_scatter(
     rng: np.random.Generator,
     fit_points: int,
     scatter_points: int,
+    colorbar_label: str = "log10(ID sequence usage)",
 ) -> None:
     n_rows = flat_values.shape[0]
     fit_idx = rng.choice(n_rows, size=min(fit_points, n_rows), replace=False)
@@ -399,19 +492,18 @@ def make_pca_scatter(
         coords[:, 0],
         coords[:, 1],
         c=log_usage,
-        s=5,
-        alpha=0.35,
+        s=7,
         cmap="viridis",
-        rasterized=True,
+        alpha=0.7,
         linewidths=0,
     )
-    colorbar = fig.colorbar(scatter, ax=ax)
-    colorbar.set_label("log10(ID sequence usage)")
     ax.set_title(title)
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
+    colorbar = fig.colorbar(scatter, ax=ax)
+    colorbar.set_label(colorbar_label)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=240)
+    fig.savefig(output_path, dpi=220)
     plt.close(fig)
 
 
@@ -443,62 +535,371 @@ def compute_action_mutual_information(
     return df, ranking
 
 
-def run_action_probes(
-    ids: np.ndarray,
-    codebook_vectors_flat: np.ndarray,
-    continuous_flat: np.ndarray,
-    targets: dict[str, np.ndarray],
+def build_probe_feature_sets(
+    *,
+    ids: np.ndarray | None,
+    codebook_vectors_flat: np.ndarray | None,
+    continuous_flat: np.ndarray | None,
+) -> dict[str, np.ndarray]:
+    feature_sets = {}
+    if ids is not None:
+        feature_sets["ids_onehot"] = ids
+    if codebook_vectors_flat is not None:
+        feature_sets["codebook_vectors"] = codebook_vectors_flat
+    if continuous_flat is not None:
+        feature_sets["continuous"] = continuous_flat
+    if not feature_sets:
+        raise ValueError("At least one feature set is required for action probes.")
+    return feature_sets
+
+
+def _select_episode_rows(
+    valid_episode_index: np.ndarray,
+    max_samples: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    unique_eps, counts = np.unique(valid_episode_index, return_counts=True)
+    if unique_eps.shape[0] < 2:
+        raise ValueError("Episode-split action probes require at least two valid episodes.")
+    if max_samples >= valid_episode_index.shape[0]:
+        return np.arange(valid_episode_index.shape[0], dtype=np.int64)
+
+    order = rng.permutation(unique_eps.shape[0])
+    selected_eps = []
+    running_total = 0
+    for order_idx in order:
+        selected_eps.append(unique_eps[order_idx])
+        running_total += int(counts[order_idx])
+        if running_total >= max_samples and len(selected_eps) >= 2:
+            break
+
+    mask = np.isin(valid_episode_index, np.asarray(selected_eps, dtype=np.int64))
+    selected_rows = np.flatnonzero(mask).astype(np.int64, copy=False)
+    if selected_rows.shape[0] == 0:
+        raise ValueError("Failed to select any rows for the episode-split probe.")
+    return selected_rows
+
+
+def make_probe_split(
+    valid_episode_index: np.ndarray,
     max_samples: int,
     test_size: float,
-    ridge_alpha: float,
     seed: int,
-) -> pd.DataFrame:
+    mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    if valid_episode_index.shape[0] < 2:
+        raise ValueError("Action probes require at least two valid rows.")
+
     rng = np.random.default_rng(seed)
-    sample_size = min(max_samples, ids.shape[0])
-    sampled_rows = rng.choice(ids.shape[0], size=sample_size, replace=False)
-    train_rows, test_rows = train_test_split(sampled_rows, test_size=test_size, random_state=seed, shuffle=True)
+    if mode == "row":
+        sample_size = min(max_samples, valid_episode_index.shape[0])
+        sampled_rows = rng.choice(valid_episode_index.shape[0], size=sample_size, replace=False)
+        train_rows, test_rows = train_test_split(sampled_rows, test_size=test_size, random_state=seed, shuffle=True)
+        return (
+            np.sort(np.asarray(train_rows, dtype=np.int64)),
+            np.sort(np.asarray(test_rows, dtype=np.int64)),
+        )
 
-    feature_sets = {
-        "ids_onehot": ids,
-        "codebook_vectors": codebook_vectors_flat,
-        "continuous": continuous_flat,
-    }
+    if mode != "episode":
+        raise ValueError(f"Unsupported probe split mode: {mode!r}")
 
+    selected_rows = _select_episode_rows(valid_episode_index, max_samples=max_samples, rng=rng)
+    selected_eps = np.unique(valid_episode_index[selected_rows])
+    if selected_eps.shape[0] < 2:
+        raise ValueError("Episode-split action probes require at least two valid episodes after sampling.")
+
+    train_eps, test_eps = train_test_split(selected_eps, test_size=test_size, random_state=seed, shuffle=True)
+    train_rows = selected_rows[np.isin(valid_episode_index[selected_rows], train_eps)]
+    test_rows = selected_rows[np.isin(valid_episode_index[selected_rows], test_eps)]
+    if train_rows.shape[0] == 0 or test_rows.shape[0] == 0:
+        raise ValueError("Episode-split action probes produced an empty train or test split.")
+    return np.sort(train_rows.astype(np.int64, copy=False)), np.sort(test_rows.astype(np.int64, copy=False))
+
+
+def transform_probe_features(
+    feature_name: str,
+    x_train: np.ndarray,
+    x_test: np.ndarray,
+    *,
+    model_name: str,
+) -> tuple[Any, Any]:
+    if feature_name == "ids_onehot":
+        encoder = make_one_hot_encoder()
+        x_train_transformed = encoder.fit_transform(x_train)
+        x_test_transformed = encoder.transform(x_test)
+        if model_name == "mlp":
+            x_train_transformed = x_train_transformed.toarray().astype(np.float32, copy=False)
+            x_test_transformed = x_test_transformed.toarray().astype(np.float32, copy=False)
+        return x_train_transformed, x_test_transformed
+
+    scaler = StandardScaler()
+    x_train_transformed = scaler.fit_transform(x_train).astype(np.float32, copy=False)
+    x_test_transformed = scaler.transform(x_test).astype(np.float32, copy=False)
+    return x_train_transformed, x_test_transformed
+
+
+def _score_probe_predictions(
+    *,
+    feature_name: str,
+    target_name: str,
+    y_test: np.ndarray,
+    prediction: np.ndarray,
+    probe_model: str,
+    split_mode: str,
+    n_train: int,
+    n_test: int,
+) -> list[dict[str, Any]]:
+    raw_r2 = r2_score(y_test, prediction, multioutput="raw_values")
+    avg_r2 = r2_score(y_test, prediction, multioutput="uniform_average")
+    raw_mse = mean_squared_error(y_test, prediction, multioutput="raw_values")
+    avg_mse = mean_squared_error(y_test, prediction, multioutput="uniform_average")
     rows = []
+    for action_dim, (r2_value, mse_value) in enumerate(zip(raw_r2.tolist(), raw_mse.tolist(), strict=True)):
+        rows.append(
+            {
+                "probe_model": probe_model,
+                "split_mode": split_mode,
+                "feature_set": feature_name,
+                "target": target_name,
+                "action_dim": action_dim,
+                "r2": float(r2_value),
+                "avg_r2_for_target": float(avg_r2),
+                "mse": float(mse_value),
+                "avg_mse_for_target": float(avg_mse),
+                "n_train": int(n_train),
+                "n_test": int(n_test),
+            }
+        )
+    return rows
+
+
+def fit_ridge_probe(
+    feature_sets: dict[str, np.ndarray],
+    targets: dict[str, np.ndarray],
+    train_rows: np.ndarray,
+    test_rows: np.ndarray,
+    ridge_alpha: float,
+    split_mode: str,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
     for feature_name, features in feature_sets.items():
         x_train = features[train_rows]
         x_test = features[test_rows]
-
-        if feature_name == "ids_onehot":
-            encoder = make_one_hot_encoder()
-            x_train_transformed = encoder.fit_transform(x_train)
-            x_test_transformed = encoder.transform(x_test)
-        else:
-            scaler = StandardScaler()
-            x_train_transformed = scaler.fit_transform(x_train)
-            x_test_transformed = scaler.transform(x_test)
-
+        x_train_transformed, x_test_transformed = transform_probe_features(
+            feature_name,
+            x_train,
+            x_test,
+            model_name="ridge",
+        )
         model = Ridge(alpha=ridge_alpha)
         for target_name, target_values in targets.items():
             y_train = target_values[train_rows]
             y_test = target_values[test_rows]
             model.fit(x_train_transformed, y_train)
             prediction = model.predict(x_test_transformed)
-            raw_r2 = r2_score(y_test, prediction, multioutput="raw_values")
-            avg_r2 = r2_score(y_test, prediction, multioutput="uniform_average")
-            for action_dim, r2_value in enumerate(raw_r2.tolist()):
-                rows.append(
-                    {
-                        "feature_set": feature_name,
-                        "target": target_name,
-                        "action_dim": action_dim,
-                        "r2": float(r2_value),
-                        "avg_r2_for_target": float(avg_r2),
-                        "n_train": int(len(train_rows)),
-                        "n_test": int(len(test_rows)),
-                    }
+            rows.extend(
+                _score_probe_predictions(
+                    feature_name=feature_name,
+                    target_name=target_name,
+                    y_test=y_test,
+                    prediction=prediction,
+                    probe_model="ridge",
+                    split_mode=split_mode,
+                    n_train=len(train_rows),
+                    n_test=len(test_rows),
                 )
+            )
     return pd.DataFrame(rows)
+
+
+def fit_mlp_probe(
+    feature_sets: dict[str, np.ndarray],
+    targets: dict[str, np.ndarray],
+    train_rows: np.ndarray,
+    test_rows: np.ndarray,
+    split_mode: str,
+    *,
+    hidden_layer_sizes: tuple[int, ...],
+    alpha: float,
+    max_iter: int,
+    early_stopping: bool,
+    n_iter_no_change: int,
+    seed: int,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for feature_name, features in feature_sets.items():
+        x_train = features[train_rows]
+        x_test = features[test_rows]
+        x_train_transformed, x_test_transformed = transform_probe_features(
+            feature_name,
+            x_train,
+            x_test,
+            model_name="mlp",
+        )
+        model = MLPRegressor(
+            hidden_layer_sizes=hidden_layer_sizes,
+            activation="relu",
+            solver="adam",
+            alpha=alpha,
+            batch_size="auto",
+            learning_rate="constant",
+            learning_rate_init=1e-3,
+            max_iter=max_iter,
+            shuffle=True,
+            random_state=seed,
+            early_stopping=early_stopping,
+            n_iter_no_change=n_iter_no_change,
+            validation_fraction=0.1,
+        )
+        for target_name, target_values in targets.items():
+            y_train = target_values[train_rows]
+            y_test = target_values[test_rows]
+            model.fit(x_train_transformed, y_train)
+            prediction = model.predict(x_test_transformed)
+            rows.extend(
+                _score_probe_predictions(
+                    feature_name=feature_name,
+                    target_name=target_name,
+                    y_test=y_test,
+                    prediction=np.asarray(prediction, dtype=np.float32),
+                    probe_model="mlp",
+                    split_mode=split_mode,
+                    n_train=len(train_rows),
+                    n_test=len(test_rows),
+                )
+            )
+    return pd.DataFrame(rows)
+
+
+def run_action_probes(
+    *,
+    ids: np.ndarray | None,
+    codebook_vectors_flat: np.ndarray | None,
+    continuous_flat: np.ndarray | None,
+    valid_episode_index: np.ndarray,
+    targets: dict[str, np.ndarray],
+    max_samples: int,
+    test_size: float,
+    probe_model: str,
+    split_mode: str,
+    ridge_alpha: float,
+    mlp_hidden_layer_sizes: tuple[int, ...],
+    mlp_alpha: float,
+    mlp_max_iter: int,
+    mlp_early_stopping: bool,
+    mlp_n_iter_no_change: int,
+    seed: int,
+) -> pd.DataFrame:
+    train_rows, test_rows = make_probe_split(
+        valid_episode_index,
+        max_samples=max_samples,
+        test_size=test_size,
+        seed=seed,
+        mode=split_mode,
+    )
+    feature_sets = build_probe_feature_sets(
+        ids=ids,
+        codebook_vectors_flat=codebook_vectors_flat,
+        continuous_flat=continuous_flat,
+    )
+
+    frames = []
+    if probe_model in {"ridge", "both"}:
+        frames.append(
+            fit_ridge_probe(
+                feature_sets,
+                targets,
+                train_rows,
+                test_rows,
+                ridge_alpha=ridge_alpha,
+                split_mode=split_mode,
+            )
+        )
+    if probe_model in {"mlp", "both"}:
+        frames.append(
+            fit_mlp_probe(
+                feature_sets,
+                targets,
+                train_rows,
+                test_rows,
+                split_mode=split_mode,
+                hidden_layer_sizes=mlp_hidden_layer_sizes,
+                alpha=mlp_alpha,
+                max_iter=mlp_max_iter,
+                early_stopping=mlp_early_stopping,
+                n_iter_no_change=mlp_n_iter_no_change,
+                seed=seed,
+            )
+        )
+    if not frames:
+        raise ValueError(f"Unsupported probe model choice: {probe_model!r}")
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .sort_values(["probe_model", "feature_set", "target", "action_dim"], ignore_index=True)
+    )
+
+
+def summarize_probe_scores(probe_df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        probe_df.groupby(["probe_model", "split_mode", "feature_set", "target"], as_index=False)
+        .agg(mean_r2=("r2", "mean"), mean_mse=("mse", "mean"))
+        .sort_values(["probe_model", "mean_r2", "mean_mse"], ascending=[True, False, True], ignore_index=True)
+    )
+
+
+def plot_probe_heatmaps(probe_df: pd.DataFrame, output_dir: Path) -> list[str]:
+    written = []
+    groups = list(probe_df.groupby(["probe_model", "split_mode"], sort=True))
+    for (probe_model, split_mode), group_df in groups:
+        row_label_df = group_df.assign(row_label=lambda df: df["feature_set"] + " -> " + df["target"])
+        r2_pivot = (
+            row_label_df.pivot_table(index="row_label", columns="action_dim", values="r2", aggfunc="mean").sort_index()
+        )
+        mse_pivot = (
+            row_label_df.pivot_table(index="row_label", columns="action_dim", values="mse", aggfunc="mean").sort_index()
+        )
+        r2_path = output_dir / f"action_probe_r2_heatmap__{probe_model}__{split_mode}.png"
+        mse_path = output_dir / f"action_probe_mse_heatmap__{probe_model}__{split_mode}.png"
+        plot_heatmap(
+            r2_pivot.to_numpy(),
+            r2_pivot.index.tolist(),
+            [f"a{int(col)}" for col in r2_pivot.columns.tolist()],
+            f"Held-Out Action Probe R^2 ({probe_model}, split={split_mode})",
+            "R^2",
+            r2_path,
+        )
+        plot_heatmap(
+            mse_pivot.to_numpy(),
+            mse_pivot.index.tolist(),
+            [f"a{int(col)}" for col in mse_pivot.columns.tolist()],
+            f"Held-Out Action Probe MSE ({probe_model}, split={split_mode})",
+            "MSE",
+            mse_path,
+        )
+        written.extend([r2_path.name, mse_path.name])
+
+        if len(groups) == 1:
+            legacy_r2 = output_dir / "action_probe_r2_heatmap.png"
+            legacy_mse = output_dir / "action_probe_mse_heatmap.png"
+            plot_heatmap(
+                r2_pivot.to_numpy(),
+                r2_pivot.index.tolist(),
+                [f"a{int(col)}" for col in r2_pivot.columns.tolist()],
+                "Held-Out Action Probe R^2",
+                "R^2",
+                legacy_r2,
+            )
+            plot_heatmap(
+                mse_pivot.to_numpy(),
+                mse_pivot.index.tolist(),
+                [f"a{int(col)}" for col in mse_pivot.columns.tolist()],
+                "Held-Out Action Probe MSE",
+                "MSE",
+                legacy_mse,
+            )
+            written.extend([legacy_r2.name, legacy_mse.name])
+    return written
 
 
 def main() -> None:
@@ -512,171 +913,229 @@ def main() -> None:
     info = load_info(dataset_root)
     dataset = make_dataset(dataset_root)
 
-    def pick_feature_name(*suffixes: str) -> str:
+    def pick_feature_name(*suffixes: str, required: bool = True) -> str | None:
         for suffix in suffixes:
             candidate = f"{args.feature_prefix}.{suffix}"
             if candidate in info["features"]:
                 return candidate
+        if not required:
+            return None
         raise KeyError(
             f"Missing feature in dataset metadata for prefix {args.feature_prefix!r}. "
             f"Tried suffixes: {list(suffixes)}"
         )
 
-    ids_col = pick_feature_name("codebook_id_latents", "codebook_ids")
+    ids_col = pick_feature_name("codebook_id_latents", "codebook_ids", required=False)
     continuous_col = pick_feature_name("continuous_vector_latents", "continuous")
-    codebook_vectors_col = pick_feature_name("codebook_vector_latents", "codebook_vectors")
+    codebook_vectors_col = pick_feature_name("codebook_vector_latents", "codebook_vectors", required=False)
     valid_col = f"{args.feature_prefix}.valid"
     action_col = "action"
 
-    for column_name in [ids_col, continuous_col, codebook_vectors_col, valid_col, action_col]:
+    required_columns = [continuous_col, valid_col, action_col]
+    for column_name in required_columns:
         if column_name not in info["features"]:
             raise KeyError(f"Missing feature in dataset metadata: {column_name}")
 
     valid_counts = load_valid_counts(dataset, valid_col)
     plot_valid_distribution(valid_counts, output_dir / "valid_distribution.png")
 
-    ids = load_ids(dataset, ids_col, valid_col)
-    unique_id_seqs, id_inverse, id_counts = unique_rows(ids)
-    id_usage_per_row = id_counts[id_inverse]
-
-    unique_sequences, unique_sequence_inverse = np.unique(
-        contiguous_row_view(ids), return_index=True
-    )
-    representative_ids = ids[unique_sequence_inverse]
-    representative_counts = id_counts[np.arange(len(unique_sequences))]
-    id_order = np.argsort(representative_counts)[::-1]
-    top_id_df = pd.DataFrame(
-        {
-            "sequence": [format_sequence(seq) for seq in representative_ids[id_order]],
-            "count": representative_counts[id_order],
-            "fraction": representative_counts[id_order] / ids.shape[0],
-        }
-    )
-    top_id_df.to_csv(output_dir / "codebook_id_sequence_counts.csv", index=False)
-    plot_top_sequences(top_id_df.head(args.top_k_sequences), output_dir / "codebook_id_top_sequences.png")
-
-    position_df = plot_id_position_counts(ids, output_dir / "codebook_id_position_counts.png")
-    position_df.to_csv(output_dir / "codebook_id_position_counts.csv", index=False)
-
     all_actions, all_valid, episode_index = load_action_context(dataset, action_col, valid_col)
     tail_counts = infer_episode_tail_counts(all_valid, episode_index)
     action_targets = derive_action_targets(all_actions, all_valid, episode_index, args.future_frames)
-    binned_action_targets, action_bin_counts = quantile_bin_targets(action_targets, args.action_bins)
-
-    action_mi_df, action_mi_ranking_df = compute_action_mutual_information(ids, id_inverse, binned_action_targets)
-    action_mi_df.to_csv(output_dir / "id_action_mutual_information.csv", index=False)
-    action_mi_ranking_df.to_csv(output_dir / "id_action_mutual_information_ranked.csv", index=False)
-
-    mi_pivot = (
-        action_mi_df.assign(row_label=lambda df: df["target"] + "_a" + df["action_dim"].astype(str))
-        .pivot(index="row_label", columns="feature", values="mi")
-        .sort_index()
-    )
-    nmi_pivot = (
-        action_mi_df.assign(row_label=lambda df: df["target"] + "_a" + df["action_dim"].astype(str))
-        .pivot(index="row_label", columns="feature", values="nmi")
-        .sort_index()
-    )
-    plot_heatmap(
-        mi_pivot.to_numpy(),
-        mi_pivot.index.tolist(),
-        mi_pivot.columns.tolist(),
-        "Mutual Information Between ID Features and Action Targets",
-        "MI",
-        output_dir / "id_action_mutual_information_heatmap.png",
-    )
-    plot_heatmap(
-        nmi_pivot.to_numpy(),
-        nmi_pivot.index.tolist(),
-        nmi_pivot.columns.tolist(),
-        "Normalized Mutual Information Between ID Features and Action Targets",
-        "NMI",
-        output_dir / "id_action_normalized_mutual_information_heatmap.png",
-    )
+    valid_episode_index = extract_valid_episode_index(all_valid, episode_index)
 
     continuous = load_float_array(dataset, continuous_col, valid_col)
-    codebook_vectors = load_float_array(dataset, codebook_vectors_col, valid_col)
-    continuous_flat = continuous.reshape(continuous.shape[0], -1)
-    codebook_vectors_flat = codebook_vectors.reshape(codebook_vectors.shape[0], -1)
+    valid_frames = int(continuous.shape[0])
+    if valid_episode_index.shape[0] != valid_frames:
+        raise ValueError(
+            "Valid-row episode index alignment failed: action targets and latent arrays disagree on row count."
+        )
 
-    continuous_exact_unique, continuous_inverse, continuous_counts = unique_rows(continuous_flat)
+    ids = None
+    id_inverse = None
+    id_counts = None
+    unique_id_seqs = None
+    top_id_df = None
+    position_df = None
+    id_usage_per_row = np.ones(valid_frames, dtype=np.int64)
+    if ids_col is not None:
+        ids = load_ids(dataset, ids_col, valid_col)
+        if ids.shape[0] != valid_frames:
+            raise ValueError("Discrete ID latents and continuous latents disagree on the number of valid rows.")
+        unique_id_seqs, id_inverse, id_counts = unique_rows(ids)
+        id_usage_per_row = id_counts[id_inverse]
+
+        unique_sequences, unique_sequence_inverse = np.unique(contiguous_row_view(ids), return_index=True)
+        representative_ids = ids[unique_sequence_inverse]
+        representative_counts = id_counts[np.arange(len(unique_sequences))]
+        id_order = np.argsort(representative_counts)[::-1]
+        top_id_df = pd.DataFrame(
+            {
+                "sequence": [format_sequence(seq) for seq in representative_ids[id_order]],
+                "count": representative_counts[id_order],
+                "fraction": representative_counts[id_order] / ids.shape[0],
+            }
+        )
+        top_id_df.to_csv(output_dir / "codebook_id_sequence_counts.csv", index=False)
+        plot_top_sequences(top_id_df.head(args.top_k_sequences), output_dir / "codebook_id_top_sequences.png")
+
+        position_df = plot_id_position_counts(ids, output_dir / "codebook_id_position_counts.png")
+        position_df.to_csv(output_dir / "codebook_id_position_counts.csv", index=False)
+
+    binned_action_targets, action_bin_counts = quantile_bin_targets(action_targets, args.action_bins)
+    action_mi_df = None
+    action_mi_ranking_df = None
+    if ids is not None and id_inverse is not None:
+        action_mi_df, action_mi_ranking_df = compute_action_mutual_information(ids, id_inverse, binned_action_targets)
+        action_mi_df.to_csv(output_dir / "id_action_mutual_information.csv", index=False)
+        action_mi_ranking_df.to_csv(output_dir / "id_action_mutual_information_ranked.csv", index=False)
+
+        mi_pivot = (
+            action_mi_df.assign(row_label=lambda df: df["target"] + "_a" + df["action_dim"].astype(str))
+            .pivot(index="row_label", columns="feature", values="mi")
+            .sort_index()
+        )
+        nmi_pivot = (
+            action_mi_df.assign(row_label=lambda df: df["target"] + "_a" + df["action_dim"].astype(str))
+            .pivot(index="row_label", columns="feature", values="nmi")
+            .sort_index()
+        )
+        plot_heatmap(
+            mi_pivot.to_numpy(),
+            mi_pivot.index.tolist(),
+            mi_pivot.columns.tolist(),
+            "Mutual Information Between ID Features and Action Targets",
+            "MI",
+            output_dir / "id_action_mutual_information_heatmap.png",
+        )
+        plot_heatmap(
+            nmi_pivot.to_numpy(),
+            nmi_pivot.index.tolist(),
+            nmi_pivot.columns.tolist(),
+            "Normalized Mutual Information Between ID Features and Action Targets",
+            "NMI",
+            output_dir / "id_action_normalized_mutual_information_heatmap.png",
+        )
+
+    continuous_flat = continuous.reshape(continuous.shape[0], -1)
+    codebook_vectors = None
+    codebook_vectors_flat = None
+    if codebook_vectors_col is not None:
+        codebook_vectors = load_float_array(dataset, codebook_vectors_col, valid_col)
+        if codebook_vectors.shape[0] != valid_frames:
+            raise ValueError("Codebook vectors and continuous latents disagree on the number of valid rows.")
+        codebook_vectors_flat = codebook_vectors.reshape(codebook_vectors.shape[0], -1)
+
+    continuous_exact_unique, _, continuous_counts = unique_rows(continuous_flat)
     continuous_rounded = np.round(continuous_flat, decimals=args.rounded_decimals)
     continuous_rounded_unique, _, continuous_rounded_counts = unique_rows(continuous_rounded)
 
-    codebook_vectors_exact_unique, codebook_vectors_inverse, codebook_vectors_counts = unique_rows(codebook_vectors_flat)
-    codebook_vectors_rounded = np.round(codebook_vectors_flat, decimals=args.rounded_decimals)
-    codebook_vectors_rounded_unique, _, codebook_vectors_rounded_counts = unique_rows(codebook_vectors_rounded)
+    codebook_vectors_exact_unique = None
+    codebook_vectors_counts = None
+    codebook_vectors_rounded = None
+    codebook_vectors_rounded_unique = None
+    codebook_vectors_rounded_counts = None
+    if codebook_vectors_flat is not None:
+        codebook_vectors_exact_unique, _, codebook_vectors_counts = unique_rows(codebook_vectors_flat)
+        codebook_vectors_rounded = np.round(codebook_vectors_flat, decimals=args.rounded_decimals)
+        codebook_vectors_rounded_unique, _, codebook_vectors_rounded_counts = unique_rows(codebook_vectors_rounded)
 
     plot_value_histogram(continuous, "Continuous Latent Value Distribution", output_dir / "continuous_value_histogram.png")
     plot_slot_norms(continuous, "Continuous Latent L2 Norms by Slot", output_dir / "continuous_slot_norms.png")
-    plot_value_histogram(
-        codebook_vectors,
-        "Codebook Vector Value Distribution",
-        output_dir / "codebook_vectors_value_histogram.png",
-    )
-    plot_slot_norms(
-        codebook_vectors,
-        "Codebook Vector L2 Norms by Slot",
-        output_dir / "codebook_vectors_slot_norms.png",
-    )
+    if codebook_vectors is not None:
+        plot_value_histogram(
+            codebook_vectors,
+            "Codebook Vector Value Distribution",
+            output_dir / "codebook_vectors_value_histogram.png",
+        )
+        plot_slot_norms(
+            codebook_vectors,
+            "Codebook Vector L2 Norms by Slot",
+            output_dir / "codebook_vectors_slot_norms.png",
+        )
 
     continuous_norms_df = summarize_norms(continuous)
     continuous_norms_df.to_csv(output_dir / "continuous_slot_norm_summary.csv", index=False)
-    codebook_vectors_norms_df = summarize_norms(codebook_vectors)
-    codebook_vectors_norms_df.to_csv(output_dir / "codebook_vectors_slot_norm_summary.csv", index=False)
+    codebook_vectors_norms_df = None
+    if codebook_vectors is not None:
+        codebook_vectors_norms_df = summarize_norms(codebook_vectors)
+        codebook_vectors_norms_df.to_csv(output_dir / "codebook_vectors_slot_norm_summary.csv", index=False)
+
+    pca_colorbar_label = "log10(ID sequence usage)" if ids is not None else "constant (discrete IDs unavailable)"
+    continuous_pca_title = (
+        "Continuous Latents PCA Colored by ID Sequence Usage" if ids is not None else "Continuous Latents PCA"
+    )
 
     make_pca_scatter(
         continuous_flat,
         id_usage_per_row,
-        "Continuous Latents PCA Colored by ID Sequence Usage",
+        continuous_pca_title,
         output_dir / "continuous_pca_by_id_sequence_usage.png",
         output_dir / "continuous_pca_sample.csv",
         rng,
         args.pca_fit_points,
         args.scatter_points,
+        colorbar_label=pca_colorbar_label,
     )
-    make_pca_scatter(
-        codebook_vectors_flat,
-        id_usage_per_row,
-        "Codebook Vectors PCA Colored by ID Sequence Usage",
-        output_dir / "codebook_vectors_pca_by_id_sequence_usage.png",
-        output_dir / "codebook_vectors_pca_sample.csv",
-        rng,
-        args.pca_fit_points,
-        args.scatter_points,
-    )
+    if codebook_vectors_flat is not None:
+        make_pca_scatter(
+            codebook_vectors_flat,
+            id_usage_per_row,
+            "Codebook Vectors PCA Colored by ID Sequence Usage" if ids is not None else "Codebook Vectors PCA",
+            output_dir / "codebook_vectors_pca_by_id_sequence_usage.png",
+            output_dir / "codebook_vectors_pca_sample.csv",
+            rng,
+            args.pca_fit_points,
+            args.scatter_points,
+            colorbar_label=pca_colorbar_label,
+        )
 
     probe_df = run_action_probes(
         ids=ids,
         codebook_vectors_flat=codebook_vectors_flat,
         continuous_flat=continuous_flat,
+        valid_episode_index=valid_episode_index,
         targets=action_targets,
         max_samples=args.probe_max_samples,
         test_size=args.probe_test_size,
+        probe_model=args.probe_model,
+        split_mode=args.probe_split,
         ridge_alpha=args.ridge_alpha,
+        mlp_hidden_layer_sizes=args.probe_mlp_hidden_dims,
+        mlp_alpha=args.probe_mlp_alpha,
+        mlp_max_iter=args.probe_mlp_max_iter,
+        mlp_early_stopping=args.probe_mlp_early_stopping,
+        mlp_n_iter_no_change=args.probe_mlp_n_iter_no_change,
         seed=args.seed,
     )
+    probe_df.to_csv(output_dir / "action_probe_scores.csv", index=False)
     probe_df.to_csv(output_dir / "action_probe_r2.csv", index=False)
-    probe_pivot = (
-        probe_df.assign(row_label=lambda df: df["feature_set"] + " -> " + df["target"])
-        .pivot_table(index="row_label", columns="action_dim", values="r2", aggfunc="mean")
-        .sort_index()
-    )
-    plot_heatmap(
-        probe_pivot.to_numpy(),
-        probe_pivot.index.tolist(),
-        [f"a{int(col)}" for col in probe_pivot.columns.tolist()],
-        "Held-Out Action Probe R^2",
-        "R^2",
-        output_dir / "action_probe_r2_heatmap.png",
-    )
-    probe_summary_df = (
-        probe_df.groupby(["feature_set", "target"], as_index=False)["r2"]
-        .mean()
-        .rename(columns={"r2": "mean_r2"})
-        .sort_values("mean_r2", ascending=False)
-    )
+
+    probe_summary_df = summarize_probe_scores(probe_df)
+    probe_summary_df.to_csv(output_dir / "action_probe_scores_summary.csv", index=False)
     probe_summary_df.to_csv(output_dir / "action_probe_r2_summary.csv", index=False)
+    probe_heatmap_artifacts = plot_probe_heatmaps(probe_df, output_dir)
+
+    best_by_probe_model = []
+    for probe_model, model_df in probe_summary_df.groupby("probe_model", sort=True):
+        best_r2_row = model_df.sort_values(["mean_r2", "mean_mse"], ascending=[False, True]).iloc[0]
+        best_mse_row = model_df.sort_values(["mean_mse", "mean_r2"], ascending=[True, False]).iloc[0]
+        best_by_probe_model.append(
+            {
+                "probe_model": probe_model,
+                "split_mode": str(best_r2_row["split_mode"]),
+                "best_mean_r2": {
+                    "feature_set": str(best_r2_row["feature_set"]),
+                    "target": str(best_r2_row["target"]),
+                    "value": float(best_r2_row["mean_r2"]),
+                },
+                "best_mean_mse": {
+                    "feature_set": str(best_mse_row["feature_set"]),
+                    "target": str(best_mse_row["target"]),
+                    "value": float(best_mse_row["mean_mse"]),
+                },
+            }
+        )
 
     summary = {
         "dataset_root": str(dataset_root),
@@ -684,7 +1143,7 @@ def main() -> None:
         "future_frames": args.future_frames,
         "total_frames": int(sum(valid_counts.values())),
         "valid_counts": valid_counts,
-        "valid_frames": int(ids.shape[0]),
+        "valid_frames": valid_frames,
         "invalid_frames": int(sum(v for k, v in valid_counts.items() if int(k) != 1)),
         "episode_invalid_tail_counts": {
             "min": int(np.min(tail_counts)),
@@ -692,7 +1151,9 @@ def main() -> None:
             "max": int(np.max(tail_counts)),
             "unique_values": sorted({int(v) for v in tail_counts}),
         },
-        "id_sequences": {
+        "id_sequences": None
+        if ids is None or id_counts is None or unique_id_seqs is None
+        else {
             "sequence_length": int(ids.shape[1]),
             "unique_sequences": unique_id_seqs,
             "singleton_sequences": int(np.sum(id_counts == 1)),
@@ -712,7 +1173,16 @@ def main() -> None:
             "rounded_singleton_rows": int(np.sum(continuous_rounded_counts == 1)),
             "rounded_max_usage": int(np.max(continuous_rounded_counts)),
         },
-        "codebook_vectors": {
+        "codebook_vectors": None
+        if (
+            codebook_vectors is None
+            or codebook_vectors_flat is None
+            or codebook_vectors_exact_unique is None
+            or codebook_vectors_counts is None
+            or codebook_vectors_rounded_unique is None
+            or codebook_vectors_rounded_counts is None
+        )
+        else {
             "shape_per_frame": list(codebook_vectors.shape[1:]),
             "flattened_dim": int(codebook_vectors_flat.shape[1]),
             "value_summary": summarize_numeric(codebook_vectors),
@@ -732,18 +1202,21 @@ def main() -> None:
             }
             for target_name, values in action_targets.items()
         },
-        "action_mutual_information": {
+        "action_mutual_information": None
+        if action_mi_ranking_df is None
+        else {
             "top_rows": action_mi_ranking_df.head(10).to_dict(orient="records"),
         },
         "action_probes": {
-            "mean_r2_by_feature_and_target": probe_summary_df.to_dict(orient="records"),
+            "probe_model": args.probe_model,
+            "split_mode": args.probe_split,
+            "mean_scores_by_feature_and_target": probe_summary_df.to_dict(orient="records"),
+            "best_by_probe_model": best_by_probe_model,
         },
         "artifacts": sorted(p.name for p in output_dir.iterdir()),
     }
     save_json(output_dir / "summary.json", summary)
 
-    top_mi_row = action_mi_ranking_df.iloc[0]
-    best_probe_row = probe_summary_df.iloc[0]
     summary_lines = [
         "# Latent Feature Distribution Analysis",
         "",
@@ -755,30 +1228,79 @@ def main() -> None:
         f"- Invalid frames: `{summary['invalid_frames']}`",
         "",
         "## ID Sequences",
-        f"- Unique sequences: `{summary['id_sequences']['unique_sequences']}`",
-        f"- Singleton sequences: `{summary['id_sequences']['singleton_sequences']}`",
-        f"- Max sequence usage: `{summary['id_sequences']['max_sequence_usage']}`",
-        f"- Median sequence usage: `{summary['id_sequences']['median_sequence_usage']:.2f}`",
-        "",
-        "## Continuous",
-        f"- Exact unique rows: `{summary['continuous']['exact_unique_rows']}`",
-        f"- Rounded unique rows ({args.rounded_decimals} decimals): `{summary['continuous']['rounded_unique_rows']}`",
-        f"- Exact max usage: `{summary['continuous']['exact_max_usage']}`",
-        "",
-        "## Codebook Vectors",
-        f"- Exact unique rows: `{summary['codebook_vectors']['exact_unique_rows']}`",
-        f"- Rounded unique rows ({args.rounded_decimals} decimals): `{summary['codebook_vectors']['rounded_unique_rows']}`",
-        f"- Exact max usage: `{summary['codebook_vectors']['exact_max_usage']}`",
-        "",
-        "## Action Mutual Information",
-        f"- Top MI pair: `{top_mi_row['feature']}` vs `{top_mi_row['target']}` dim `{int(top_mi_row['action_dim'])}` with MI `{top_mi_row['mi']:.4f}` and NMI `{top_mi_row['nmi']:.4f}`",
-        "",
-        "## Action Probes",
-        f"- Best mean held-out R^2: `{best_probe_row['feature_set']}` -> `{best_probe_row['target']}` = `{best_probe_row['mean_r2']:.4f}`",
-        "",
-        "## Scatter Plot Coloring",
-        "- PCA plots are colored by `log10(ID sequence usage)` for the corresponding frame.",
     ]
+    if summary["id_sequences"] is not None:
+        summary_lines.extend(
+            [
+                f"- Unique sequences: `{summary['id_sequences']['unique_sequences']}`",
+                f"- Singleton sequences: `{summary['id_sequences']['singleton_sequences']}`",
+                f"- Max sequence usage: `{summary['id_sequences']['max_sequence_usage']}`",
+                f"- Median sequence usage: `{summary['id_sequences']['median_sequence_usage']:.2f}`",
+            ]
+        )
+    else:
+        summary_lines.append("- Unavailable for this dataset because no discrete codebook ID latents were exported.")
+    summary_lines.extend(
+        [
+            "",
+            "## Continuous",
+            f"- Exact unique rows: `{summary['continuous']['exact_unique_rows']}`",
+            f"- Rounded unique rows ({args.rounded_decimals} decimals): `{summary['continuous']['rounded_unique_rows']}`",
+            f"- Exact max usage: `{summary['continuous']['exact_max_usage']}`",
+            "",
+            "## Codebook Vectors",
+        ]
+    )
+    if summary["codebook_vectors"] is not None:
+        summary_lines.extend(
+            [
+                f"- Exact unique rows: `{summary['codebook_vectors']['exact_unique_rows']}`",
+                f"- Rounded unique rows ({args.rounded_decimals} decimals): `{summary['codebook_vectors']['rounded_unique_rows']}`",
+                f"- Exact max usage: `{summary['codebook_vectors']['exact_max_usage']}`",
+            ]
+        )
+    else:
+        summary_lines.append("- Unavailable for this dataset because no codebook vector latents were exported.")
+    summary_lines.extend(
+        [
+            "",
+            "## Action Mutual Information",
+        ]
+    )
+    if action_mi_ranking_df is not None:
+        top_mi_row = action_mi_ranking_df.iloc[0]
+        summary_lines.append(
+            f"- Top MI pair: `{top_mi_row['feature']}` vs `{top_mi_row['target']}` dim `{int(top_mi_row['action_dim'])}` with MI `{top_mi_row['mi']:.4f}` and NMI `{top_mi_row['nmi']:.4f}`"
+        )
+    else:
+        summary_lines.append("- Unavailable for this dataset because no discrete ID latents were exported.")
+    summary_lines.extend(
+        [
+            "",
+            "## Action Probes",
+            f"- Probe split mode: `{args.probe_split}`",
+            f"- Probe backends requested: `{args.probe_model}`",
+        ]
+    )
+    for best in best_by_probe_model:
+        summary_lines.extend(
+            [
+                f"- Best mean held-out R^2 ({best['probe_model']}): `{best['best_mean_r2']['feature_set']}` -> `{best['best_mean_r2']['target']}` = `{best['best_mean_r2']['value']:.4f}`",
+                f"- Best mean held-out MSE ({best['probe_model']}): `{best['best_mean_mse']['feature_set']}` -> `{best['best_mean_mse']['target']}` = `{best['best_mean_mse']['value']:.6f}`",
+            ]
+        )
+    summary_lines.extend(
+        [
+            "",
+            "## Scatter Plot Coloring",
+            "- PCA plots are colored by `log10(ID sequence usage)` for the corresponding frame."
+            if ids is not None
+            else "- PCA plots use a constant color scale because discrete ID sequence usage is unavailable.",
+            "",
+            "## Probe Heatmaps",
+        ]
+    )
+    summary_lines.extend(f"- `{artifact}`" for artifact in sorted(probe_heatmap_artifacts))
     (output_dir / "README.md").write_text("\n".join(summary_lines) + "\n")
 
 

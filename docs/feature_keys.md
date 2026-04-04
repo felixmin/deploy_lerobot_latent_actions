@@ -10,9 +10,13 @@ Recommended default:
 - `latent_labels.continuous_vector_latents`
 - `latent_labels.valid`
 
-Alternative prefixes are fine if they are top-level, for example:
+`latent_labels.*` should be the default for general-purpose datasets and examples.
+
+Alternative prefixes are possible if they are top-level, for example:
 - `lam_lapa.continuous_vector_latents`
 - `teacher_latents.continuous_vector_latents`
+
+But they are not the preferred default because they encode provenance into the feature name.
 
 ## What Not To Do
 
@@ -48,6 +52,7 @@ Prefer:
 
 Over:
 - `lapa_lam_120000.continuous_vector_latents`
+- `lam_lapa.continuous_vector_latents`
 - `run42_teacher.continuous_vector_latents`
 
 Put provenance in:

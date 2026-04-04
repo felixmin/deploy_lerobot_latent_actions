@@ -62,7 +62,7 @@ python scripts/label_lerobot_dataset.py \
 ```
 
 Important points:
-- `feature_prefix` should be a top-level namespace such as `latent_labels`
+- `feature_prefix` should usually be `latent_labels`
 - do not use `observation.latent`
 - the output dataset includes the original source data plus extra latent supervision features
 - the exporter writes a `label_manifest.json` describing the origin and feature names
@@ -80,6 +80,10 @@ You should see feature names like:
 If the policy exposes quantized representations, you may also see:
 - `latent_labels.codebook_id_latents`
 - `latent_labels.codebook_vector_latents`
+
+Optional analysis scripts:
+- `scripts/analyze_latent_feature_distribution.py` for distribution plots, MI/NMI, and held-out action probes
+- `scripts/analyze_spcfc.py` for CoMo-style S-PCFC computed from a checkpoint plus raw frame pairs
 
 ## 5. Train A Downstream Policy
 
@@ -112,15 +116,6 @@ The mixed dataset should provide the branch-routing booleans:
 
 This is the setup used in the `lam_lapa -> latent_smolvla` example.
 
-## Worked Example Summary
-
-1. train `lam_lapa`
-2. export labels from its checkpoint onto LIBERO
-3. use a top-level prefix such as `latent_labels`
-4. train `latent_smolvla` with:
-   - `latent_labels.continuous_vector_latents`
-   - `latent_labels.valid`
-   - `latent_supervision`
-   - `action_supervision`
-
 The detailed concrete commands are in [Worked Example: lam_lapa -> latent_smolvla](examples/lam_lapa_to_latent_smolvla.md).
+
+Metric definitions and interpretation are described in [Analysis](analysis.md).
