@@ -16,6 +16,17 @@ def test_extract_valid_episode_index_matches_valid_rows():
     assert result.tolist() == [0, 0, 1, 1, 1]
 
 
+def test_derive_action_targets_truncates_to_valid_prefix():
+    actions = np.arange(10, dtype=np.float32).reshape(5, 2)
+    valid = np.array([1, 1, 0, 0, 0], dtype=np.int64)
+    episode_index = np.zeros(5, dtype=np.int64)
+
+    targets = analysis.derive_action_targets(actions, valid, episode_index, future_frames=2)
+
+    assert targets["current_action"].shape == (2, 2)
+    assert targets["future_action_mean"].shape == (2, 2)
+
+
 def test_unique_rows_handles_single_slot_id_arrays():
     ids = np.array([7, 7, 3, 7, 3], dtype=np.int64)
 
@@ -64,6 +75,63 @@ def test_summarize_norms_handles_single_slot_vectors():
 
     assert summary_df["slot_index"].tolist() == [0]
     assert float(summary_df["mean"].iloc[0]) > 0.0
+
+
+def test_make_discrete_bucket_spec_uses_full_id_sequences():
+    ids = np.array([[1, 2], [1, 2], [3, 4], [3, 4], [9, 9]], dtype=np.int64)
+    _, id_inverse, _ = analysis.unique_rows(ids)
+
+    bucket_spec = analysis.make_discrete_bucket_spec(ids, id_inverse)
+
+    assert bucket_spec["feature_set"] == "id_sequence"
+    assert bucket_spec["bucket_kind"] == "discrete_sequence"
+    assert bucket_spec["bucket_counts"].tolist() == [2, 2, 1]
+    assert bucket_spec["bucket_names"].tolist() == ["1 2", "3 4", "9 9"]
+
+
+def test_compute_bucket_action_statistics_recovers_perfect_bucket_means():
+    bucket_index = np.array([0, 0, 1, 1], dtype=np.int64)
+    bucket_names = np.array(["left", "right"], dtype=object)
+    target_values = np.array(
+        [
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [2.0, 2.0],
+            [2.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+
+    stats_df, summary = analysis.compute_bucket_action_statistics(
+        bucket_index=bucket_index,
+        bucket_names=bucket_names,
+        target_values=target_values,
+    )
+
+    assert stats_df["count"].tolist() == [2, 2]
+    assert stats_df["bucket_label"].tolist() == ["left", "right"]
+    assert abs(float(summary["mean_variance_explained"]) - 1.0) < 1e-6
+    assert abs(float(summary["mean_within_bucket_std"])) < 1e-6
+
+
+def test_make_continuous_bucket_spec_assigns_two_clusters():
+    rng = np.random.default_rng(0)
+    cluster_a = rng.normal(loc=-3.0, scale=0.1, size=(24, 4)).astype(np.float32)
+    cluster_b = rng.normal(loc=3.0, scale=0.1, size=(24, 4)).astype(np.float32)
+    continuous = np.concatenate([cluster_a, cluster_b], axis=0)
+
+    bucket_spec = analysis.make_continuous_bucket_spec(
+        continuous,
+        n_clusters=2,
+        fit_samples=48,
+        seed=0,
+    )
+
+    counts = np.sort(bucket_spec["bucket_counts"])
+    assert bucket_spec["feature_set"] == "continuous_kmeans"
+    assert bucket_spec["bucket_kind"] == "kmeans"
+    assert int(bucket_spec["effective_clusters"]) == 2
+    assert counts.tolist() == [24, 24]
 
 
 def test_fit_ridge_probe_returns_expected_schema():

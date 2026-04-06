@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
+from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error, mutual_info_score, normalized_mutual_info_score, r2_score
@@ -131,6 +132,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="Patience used by the MLP action probe when early stopping is enabled.",
+    )
+    parser.add_argument(
+        "--bucket-kmeans-clusters",
+        type=int,
+        default=128,
+        help="Number of KMeans buckets used for continuous latents. Set to 0 to disable continuous bucketing.",
+    )
+    parser.add_argument(
+        "--bucket-kmeans-fit-samples",
+        type=int,
+        default=50000,
+        help="Maximum number of rows used to fit the continuous KMeans bucketing model.",
+    )
+    parser.add_argument(
+        "--bucket-top-k",
+        type=int,
+        default=20,
+        help="How many top buckets by count to keep in the JSON and README summaries.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     return parser.parse_args()
@@ -295,7 +314,12 @@ def derive_action_targets(
         current_chunks.append(actions_ep[:n_valid])
         cumsum = np.vstack([np.zeros((1, actions_ep.shape[1]), dtype=np.float32), np.cumsum(actions_ep, axis=0)])
         future_sum = cumsum[1 + future_frames :] - cumsum[1:-future_frames]
-        future_mean_chunks.append((future_sum / float(future_frames)).astype(np.float32, copy=False))
+        future_mean = (future_sum / float(future_frames)).astype(np.float32, copy=False)
+        if future_mean.shape[0] < n_valid:
+            raise ValueError(
+                f"Derived future action target is too short for episode with n_valid={n_valid} and future_frames={future_frames}."
+            )
+        future_mean_chunks.append(future_mean[:n_valid])
 
     return {
         "current_action": np.concatenate(current_chunks, axis=0),
@@ -533,6 +557,222 @@ def compute_action_mutual_information(
     df = pd.DataFrame(rows)
     ranking = df.sort_values(["mi", "nmi"], ascending=[False, False]).reset_index(drop=True)
     return df, ranking
+
+
+def group_rows_by_bucket(bucket_index: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if bucket_index.ndim != 1:
+        raise ValueError(f"Expected 1D bucket index array, got shape={bucket_index.shape}.")
+    if bucket_index.shape[0] == 0:
+        return (
+            np.empty((0,), dtype=np.int64),
+            np.empty((0,), dtype=np.int64),
+            np.empty((0,), dtype=np.int64),
+            np.empty((0,), dtype=np.int64),
+        )
+
+    order = np.argsort(bucket_index, kind="stable")
+    sorted_bucket_index = bucket_index[order]
+    split_points = np.flatnonzero(np.diff(sorted_bucket_index)) + 1
+    starts = np.concatenate(([0], split_points)).astype(np.int64, copy=False)
+    ends = np.concatenate((split_points, [sorted_bucket_index.shape[0]])).astype(np.int64, copy=False)
+    bucket_ids = sorted_bucket_index[starts].astype(np.int64, copy=False)
+    return order.astype(np.int64, copy=False), bucket_ids, starts, ends
+
+
+def compute_bucket_action_statistics(
+    *,
+    bucket_index: np.ndarray,
+    bucket_names: np.ndarray,
+    target_values: np.ndarray,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if bucket_index.shape[0] != target_values.shape[0]:
+        raise ValueError("Bucket indices and action targets must have the same number of rows.")
+    if bucket_names.ndim != 1:
+        raise ValueError(f"Expected 1D bucket names array, got shape={bucket_names.shape}.")
+
+    total_rows = int(bucket_index.shape[0])
+    counts = np.bincount(bucket_index, minlength=int(bucket_names.shape[0]))
+    order, active_bucket_ids, starts, ends = group_rows_by_bucket(bucket_index)
+    sorted_targets = target_values[order].astype(np.float64, copy=False)
+    global_var = np.var(target_values.astype(np.float64, copy=False), axis=0)
+    within_var_numer = np.zeros(target_values.shape[1], dtype=np.float64)
+    weighted_std_sum = np.zeros(target_values.shape[1], dtype=np.float64)
+
+    rows: list[dict[str, Any]] = []
+    for bucket_id, start, end in zip(active_bucket_ids.tolist(), starts.tolist(), ends.tolist(), strict=True):
+        bucket_target = sorted_targets[start:end]
+        count = int(end - start)
+        fraction = float(count / total_rows)
+        mean = np.mean(bucket_target, axis=0)
+        std = np.std(bucket_target, axis=0)
+        var = np.var(bucket_target, axis=0)
+        within_var_numer += var * count
+        weighted_std_sum += std * count
+
+        row: dict[str, Any] = {
+            "bucket_id": int(bucket_id),
+            "bucket_label": str(bucket_names[bucket_id]),
+            "count": count,
+            "fraction": fraction,
+        }
+        for action_dim, value in enumerate(mean.tolist()):
+            row[f"mean_a{action_dim}"] = float(value)
+        for action_dim, value in enumerate(std.tolist()):
+            row[f"std_a{action_dim}"] = float(value)
+        rows.append(row)
+
+    stats_df = pd.DataFrame(rows).sort_values(["count", "bucket_id"], ascending=[False, True], ignore_index=True)
+    within_var = within_var_numer / float(max(total_rows, 1))
+    variance_explained = np.where(global_var > 1e-12, 1.0 - (within_var / global_var), 0.0)
+    weighted_mean_std = weighted_std_sum / float(max(total_rows, 1))
+
+    summary = {
+        "total_rows": total_rows,
+        "total_buckets": int(bucket_names.shape[0]),
+        "active_buckets": int(active_bucket_ids.shape[0]),
+        "singleton_buckets": int(np.sum(counts == 1)),
+        "max_bucket_usage": int(np.max(counts)) if counts.shape[0] > 0 else 0,
+        "max_bucket_fraction": float(np.max(counts) / total_rows) if total_rows > 0 and counts.shape[0] > 0 else 0.0,
+        "mean_variance_explained": float(np.mean(variance_explained)),
+        "variance_explained_by_dim": [float(value) for value in variance_explained.tolist()],
+        "mean_within_bucket_std": float(np.mean(weighted_mean_std)),
+        "within_bucket_std_by_dim": [float(value) for value in weighted_mean_std.tolist()],
+    }
+    return stats_df, summary
+
+
+def make_discrete_bucket_spec(ids: np.ndarray, id_inverse: np.ndarray) -> dict[str, Any]:
+    unique_labels, first_indices = np.unique(id_inverse, return_index=True)
+    if unique_labels.shape[0] == 0:
+        raise ValueError("Expected at least one discrete bucket.")
+    if not np.array_equal(unique_labels, np.arange(unique_labels.shape[0], dtype=np.int64)):
+        raise ValueError("Discrete ID inverse labels must be dense and zero-based.")
+
+    bucket_names = np.asarray([format_sequence(seq) for seq in ids[first_indices]], dtype=object)
+    counts = np.bincount(id_inverse, minlength=bucket_names.shape[0]).astype(np.int64, copy=False)
+    return {
+        "feature_set": "id_sequence",
+        "bucket_kind": "discrete_sequence",
+        "bucket_index": id_inverse.astype(np.int64, copy=False),
+        "bucket_names": bucket_names,
+        "bucket_counts": counts,
+    }
+
+
+def make_continuous_bucket_spec(
+    continuous_flat: np.ndarray,
+    *,
+    n_clusters: int,
+    fit_samples: int,
+    seed: int,
+) -> dict[str, Any]:
+    if n_clusters < 1:
+        raise ValueError("Continuous bucketing requires at least one cluster.")
+    if fit_samples < 1:
+        raise ValueError("Continuous bucketing requires at least one fit sample.")
+
+    n_rows = continuous_flat.shape[0]
+    effective_clusters = min(int(n_clusters), int(n_rows))
+    rng = np.random.default_rng(seed)
+    fit_size = min(int(fit_samples), int(n_rows))
+    fit_idx = rng.choice(n_rows, size=fit_size, replace=False)
+
+    scaler = StandardScaler()
+    fit_values = scaler.fit_transform(continuous_flat[fit_idx]).astype(np.float32, copy=False)
+    full_values = scaler.transform(continuous_flat).astype(np.float32, copy=False)
+
+    batch_size = min(max(1024, 4 * effective_clusters), full_values.shape[0])
+    model = MiniBatchKMeans(
+        n_clusters=effective_clusters,
+        random_state=seed,
+        batch_size=batch_size,
+        n_init=3,
+        max_iter=100,
+    )
+    model.fit(fit_values)
+    bucket_index = model.predict(full_values).astype(np.int64, copy=False)
+    counts = np.bincount(bucket_index, minlength=effective_clusters).astype(np.int64, copy=False)
+    bucket_names = np.asarray([f"cluster_{bucket_id}" for bucket_id in range(effective_clusters)], dtype=object)
+    center_norms = np.linalg.norm(model.cluster_centers_.astype(np.float64, copy=False), axis=1)
+
+    return {
+        "feature_set": "continuous_kmeans",
+        "bucket_kind": "kmeans",
+        "bucket_index": bucket_index,
+        "bucket_names": bucket_names,
+        "bucket_counts": counts,
+        "fit_rows": int(fit_size),
+        "requested_clusters": int(n_clusters),
+        "effective_clusters": int(effective_clusters),
+        "cluster_center_l2_norm_mean": float(np.mean(center_norms)),
+        "cluster_center_l2_norm_std": float(np.std(center_norms)),
+    }
+
+
+def run_action_bucket_analysis(
+    *,
+    bucket_specs: list[dict[str, Any]],
+    action_targets: dict[str, np.ndarray],
+    output_dir: Path,
+    top_k: int,
+) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
+    summary_rows: list[dict[str, Any]] = []
+    json_summary: dict[str, dict[str, Any]] = {}
+
+    for bucket_spec in bucket_specs:
+        feature_set = str(bucket_spec["feature_set"])
+        bucket_index = np.asarray(bucket_spec["bucket_index"], dtype=np.int64)
+        bucket_names = np.asarray(bucket_spec["bucket_names"], dtype=object)
+        bucket_counts = np.asarray(bucket_spec["bucket_counts"], dtype=np.int64)
+        feature_summary: dict[str, Any] = {
+            "bucket_kind": str(bucket_spec["bucket_kind"]),
+            "total_buckets": int(bucket_names.shape[0]),
+            "active_buckets": int(np.sum(bucket_counts > 0)),
+            "singleton_buckets": int(np.sum(bucket_counts == 1)),
+            "max_bucket_usage": int(np.max(bucket_counts)) if bucket_counts.shape[0] > 0 else 0,
+            "max_bucket_fraction": float(np.max(bucket_counts) / bucket_index.shape[0]) if bucket_index.shape[0] > 0 and bucket_counts.shape[0] > 0 else 0.0,
+            "targets": {},
+        }
+        for key in ("fit_rows", "requested_clusters", "effective_clusters", "cluster_center_l2_norm_mean", "cluster_center_l2_norm_std"):
+            if key in bucket_spec:
+                feature_summary[key] = bucket_spec[key]
+
+        for target_name, target_values in action_targets.items():
+            stats_df, target_summary = compute_bucket_action_statistics(
+                bucket_index=bucket_index,
+                bucket_names=bucket_names,
+                target_values=target_values,
+            )
+            stats_path = output_dir / f"action_buckets__{feature_set}__{target_name}.csv"
+            stats_df.to_csv(stats_path, index=False)
+            summary_rows.append(
+                {
+                    "feature_set": feature_set,
+                    "bucket_kind": str(bucket_spec["bucket_kind"]),
+                    "target": target_name,
+                    "total_buckets": int(feature_summary["total_buckets"]),
+                    "active_buckets": int(target_summary["active_buckets"]),
+                    "singleton_buckets": int(target_summary["singleton_buckets"]),
+                    "max_bucket_usage": int(target_summary["max_bucket_usage"]),
+                    "max_bucket_fraction": float(target_summary["max_bucket_fraction"]),
+                    "mean_variance_explained": float(target_summary["mean_variance_explained"]),
+                    "mean_within_bucket_std": float(target_summary["mean_within_bucket_std"]),
+                }
+            )
+            feature_summary["targets"][target_name] = {
+                **target_summary,
+                "artifact": stats_path.name,
+                "top_rows": stats_df.head(top_k).to_dict(orient="records"),
+            }
+        json_summary[feature_set] = feature_summary
+
+    summary_df = pd.DataFrame(summary_rows).sort_values(
+        ["mean_variance_explained", "max_bucket_fraction"],
+        ascending=[False, False],
+        ignore_index=True,
+    )
+    summary_df.to_csv(output_dir / "action_bucket_summary.csv", index=False)
+    return summary_df, json_summary
 
 
 def build_probe_feature_sets(
@@ -905,6 +1145,12 @@ def plot_probe_heatmaps(probe_df: pd.DataFrame, output_dir: Path) -> list[str]:
 def main() -> None:
     args = parse_args()
     rng = np.random.default_rng(args.seed)
+    if args.bucket_kmeans_clusters < 0:
+        raise ValueError("--bucket-kmeans-clusters must be >= 0.")
+    if args.bucket_kmeans_fit_samples < 1:
+        raise ValueError("--bucket-kmeans-fit-samples must be >= 1.")
+    if args.bucket_top_k < 1:
+        raise ValueError("--bucket-top-k must be >= 1.")
 
     dataset_root = args.dataset_root.resolve()
     output_dir = args.output_dir.resolve()
@@ -1090,6 +1336,44 @@ def main() -> None:
             colorbar_label=pca_colorbar_label,
         )
 
+    bucket_specs = []
+    if ids is not None and id_inverse is not None:
+        bucket_specs.append(make_discrete_bucket_spec(ids, id_inverse))
+    if args.bucket_kmeans_clusters > 0:
+        bucket_specs.append(
+            make_continuous_bucket_spec(
+                continuous_flat,
+                n_clusters=args.bucket_kmeans_clusters,
+                fit_samples=args.bucket_kmeans_fit_samples,
+                seed=args.seed,
+            )
+        )
+
+    if bucket_specs:
+        action_bucket_summary_df, action_bucket_summary = run_action_bucket_analysis(
+            bucket_specs=bucket_specs,
+            action_targets=action_targets,
+            output_dir=output_dir,
+            top_k=args.bucket_top_k,
+        )
+    else:
+        action_bucket_summary_df = pd.DataFrame(
+            columns=[
+                "feature_set",
+                "bucket_kind",
+                "target",
+                "total_buckets",
+                "active_buckets",
+                "singleton_buckets",
+                "max_bucket_usage",
+                "max_bucket_fraction",
+                "mean_variance_explained",
+                "mean_within_bucket_std",
+            ]
+        )
+        action_bucket_summary = {}
+        action_bucket_summary_df.to_csv(output_dir / "action_bucket_summary.csv", index=False)
+
     probe_df = run_action_probes(
         ids=ids,
         codebook_vectors_flat=codebook_vectors_flat,
@@ -1213,6 +1497,10 @@ def main() -> None:
             "mean_scores_by_feature_and_target": probe_summary_df.to_dict(orient="records"),
             "best_by_probe_model": best_by_probe_model,
         },
+        "action_buckets": {
+            "summary_rows": action_bucket_summary_df.to_dict(orient="records"),
+            "by_feature_set": action_bucket_summary,
+        },
         "artifacts": sorted(p.name for p in output_dir.iterdir()),
     }
     save_json(output_dir / "summary.json", summary)
@@ -1289,6 +1577,14 @@ def main() -> None:
                 f"- Best mean held-out MSE ({best['probe_model']}): `{best['best_mean_mse']['feature_set']}` -> `{best['best_mean_mse']['target']}` = `{best['best_mean_mse']['value']:.6f}`",
             ]
         )
+    summary_lines.extend(["", "## Action Buckets"])
+    if action_bucket_summary_df.shape[0] > 0:
+        for row in action_bucket_summary_df.head(args.bucket_top_k).to_dict(orient="records"):
+            summary_lines.append(
+                f"- `{row['feature_set']}` -> `{row['target']}`: mean variance explained `{row['mean_variance_explained']:.4f}` across `{int(row['active_buckets'])}` active buckets"
+            )
+    else:
+        summary_lines.append("- No action bucket analysis was run.")
     summary_lines.extend(
         [
             "",

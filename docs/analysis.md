@@ -15,6 +15,7 @@ Use them for different questions.
 It computes:
 - validity counts
 - codebook ID usage statistics
+- action-bucket summaries that map latent buckets to robot action mean/std statistics
 - mutual information (`MI`) and normalized mutual information (`NMI`) between discrete IDs and binned action targets
 - PCA scatter plots for continuous and codebook-vector latents
 - held-out action probes from latent features to actions
@@ -42,10 +43,33 @@ Available split modes:
 - `episode`
 
 Important outputs:
+- `action_bucket_summary.csv`
+- `action_buckets__<feature_set>__<target>.csv`
 - `action_probe_scores.csv`
 - `action_probe_scores_summary.csv`
 - `action_probe_r2_heatmap__<probe_model>__<split_mode>.png`
 - `action_probe_mse_heatmap__<probe_model>__<split_mode>.png`
+
+### Action Buckets
+
+This analysis groups latent rows into buckets and then measures the underlying robot actions inside each bucket.
+
+Bucket definitions:
+- discrete models: one bucket per full codebook ID sequence
+- continuous models: `MiniBatchKMeans` buckets over flattened continuous latents
+
+Per bucket, the script reports:
+- count and fraction
+- action mean per dimension
+- action standard deviation per dimension
+
+The summary table also reports `mean_variance_explained`, which is the fraction of action variance explained by bucket
+identity when each bucket predicts its own empirical mean action.
+
+Interpretation:
+- higher `mean_variance_explained` means the buckets align more cleanly with distinct robot actions
+- lower within-bucket action std means the latent bucket is behaviorally tighter
+- unlike the held-out action probe, this is a descriptive clustering diagnostic rather than a generalization metric
 
 #### `R^2`
 
@@ -158,6 +182,10 @@ Use probe `MSE` when:
 
 Use `MI` / `NMI` when:
 - you want to inspect whether discrete code usage is related to actions at all
+
+Use action buckets when:
+- you want an interpretable mapping from latent buckets to robot-action prototypes
+- you want to inspect action mean/std for each discrete code or continuous cluster
 
 Use `S-PCFC` when:
 - you want a motion-fidelity / static-redundancy diagnostic rather than a direct action-prediction metric

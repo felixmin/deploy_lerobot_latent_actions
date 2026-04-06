@@ -14,7 +14,9 @@ import torch
 
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.datasets.compute_stats import compute_episode_stats
 from lerobot.datasets.dataset_tools import add_features
+from lerobot.datasets.io_utils import write_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_policy
 from lerobot.utils.import_utils import register_third_party_plugins
@@ -147,6 +149,37 @@ def _format_feature_values(values: np.ndarray, shape: tuple[int, ...]) -> np.nda
     for idx in range(values.shape[0]):
         formatted[idx] = values[idx]
     return formatted
+
+
+def _compute_float_feature_stats(
+    *,
+    label_arrays: dict[str, np.ndarray],
+    valid_supervision: np.ndarray,
+    feature_infos: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, np.ndarray]]:
+    valid_rows = valid_supervision.reshape(-1).astype(bool, copy=False)
+    if not valid_rows.any():
+        return {}
+
+    float_feature_data = {}
+    float_feature_infos = {}
+    for name, info in feature_infos.items():
+        dtype = np.dtype(info["dtype"])
+        if not np.issubdtype(dtype, np.floating):
+            continue
+        values = label_arrays[name][valid_rows]
+        if values.shape[0] == 0:
+            continue
+        float_feature_data[name] = values
+        float_feature_infos[name] = info
+
+    if not float_feature_data:
+        return {}
+
+    return compute_episode_stats(
+        episode_data=float_feature_data,
+        features=float_feature_infos,
+    )
 
 
 def export_latent_dataset(cfg: LatentExportConfig) -> None:
@@ -297,6 +330,23 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
         repo_id=cfg.output_repo_id,
     )
 
+    latent_stats = _compute_float_feature_stats(
+        label_arrays=label_arrays,
+        valid_supervision=valid_supervision,
+        feature_infos=feature_infos,
+    )
+    if latent_stats:
+        merged_stats = dict(relabeled_dataset.meta.stats or {})
+        prefixed_latent_stats = {
+            f"{cfg.feature_prefix}.{name}": stats for name, stats in latent_stats.items()
+        }
+        merged_stats.update(prefixed_latent_stats)
+        write_stats(merged_stats, relabeled_dataset.root)
+        logging.info(
+            "Wrote latent feature stats for %s",
+            sorted(prefixed_latent_stats.keys()),
+        )
+
     manifest = {
         "policy_type": cfg.policy.type,
         "policy_path": str(cfg.policy.pretrained_path),
@@ -310,6 +360,11 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
             name: f"{cfg.feature_prefix}.{name}" for name in plan["representations"]
         },
         "valid_feature_name": f"{cfg.feature_prefix}.valid",
+        "stats_feature_names": [
+            f"{cfg.feature_prefix}.{name}"
+            for name, info in feature_infos.items()
+            if np.issubdtype(np.dtype(info["dtype"]), np.floating)
+        ],
         "delta_timestamps": plan["delta_timestamps"],
         "num_valid_labels": int(valid_supervision.sum()),
     }
