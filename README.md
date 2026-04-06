@@ -40,6 +40,12 @@ python scripts/analyze_latent_feature_distribution.py --help
 python scripts/analyze_spcfc.py --help
 ```
 
+Lightweight export entrypoint for analysis without copying observations:
+
+```bash
+python scripts/export_latent_analysis_dataset.py --help
+```
+
 ## Key Design Rules
 
 - Use `latent_labels` as the default top-level namespace.

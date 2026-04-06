@@ -311,6 +311,12 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
             if cfg.max_valid_samples is not None and written >= cfg.max_valid_samples:
                 break
 
+    logging.info(
+        "Finalizing labeled dataset: output_dir=%s valid_labels=%d feature_names=%s",
+        output_dir,
+        int(valid_supervision.sum()),
+        [f"{cfg.feature_prefix}.{name}" for name in plan["representations"]],
+    )
     relabeled_dataset = add_features(
         dataset=source_dataset,
         features={
@@ -337,15 +343,10 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
     )
     if latent_stats:
         merged_stats = dict(relabeled_dataset.meta.stats or {})
-        prefixed_latent_stats = {
-            f"{cfg.feature_prefix}.{name}": stats for name, stats in latent_stats.items()
-        }
-        merged_stats.update(prefixed_latent_stats)
-        write_stats(merged_stats, relabeled_dataset.root)
-        logging.info(
-            "Wrote latent feature stats for %s",
-            sorted(prefixed_latent_stats.keys()),
+        merged_stats.update(
+            {f"{cfg.feature_prefix}.{name}": stats for name, stats in latent_stats.items()}
         )
+        write_stats(merged_stats, relabeled_dataset.root)
 
     manifest = {
         "policy_type": cfg.policy.type,

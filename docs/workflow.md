@@ -67,6 +67,32 @@ Important points:
 - the output dataset includes the original source data plus extra latent supervision features
 - the exporter writes a `label_manifest.json` describing the origin and feature names
 
+### Lightweight Alternative For Analysis
+
+If you only need action-plus-latent analysis and do not want to copy observations or videos, use:
+
+```bash
+python scripts/export_latent_analysis_dataset.py \
+  --policy.path=/path/to/checkpoint/pretrained_model \
+  --policy.discover_packages_path=your_policy_package \
+  --dataset_repo_id=HuggingFaceVLA/libero \
+  --dataset_root=/path/to/libero \
+  --output_dir=/path/to/output_analysis_dataset \
+  --output_repo_id=your_namespace/your_analysis_dataset \
+  --feature_prefix=latent_labels
+```
+
+This writes a minimal analyzer-compatible root with:
+- `meta/info.json`
+- `data/*.parquet`
+
+and only the columns needed for downstream latent analysis, such as:
+- `action`
+- `episode_index`
+- `index`
+- `latent_labels.continuous_vector_latents`
+- `latent_labels.valid`
+
 ## 4. Inspect The Labeled Dataset
 
 Check:
