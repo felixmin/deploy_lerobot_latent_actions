@@ -3,6 +3,7 @@
 import json
 import logging
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,12 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_policy
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.utils import init_logging
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from _artifact_registry import infer_checkpoint_metadata, make_artifact_id, register_artifact
 
 PROGRESS_LOG_EVERY_BATCHES = 100
 
@@ -348,7 +355,8 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
         )
         write_stats(merged_stats, relabeled_dataset.root)
 
-    manifest = {
+    checkpoint_meta = infer_checkpoint_metadata(cfg.policy.pretrained_path)
+    label_manifest = {
         "policy_type": cfg.policy.type,
         "policy_path": str(cfg.policy.pretrained_path),
         "source_dataset_repo_id": cfg.dataset_repo_id,
@@ -369,11 +377,53 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
         "delta_timestamps": plan["delta_timestamps"],
         "num_valid_labels": int(valid_supervision.sum()),
     }
-    manifest_path = output_dir / "label_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    label_manifest_path = output_dir / "label_manifest.json"
+    label_manifest_path.write_text(json.dumps(label_manifest, indent=2) + "\n")
+
+    export_manifest_path = output_dir / "export_manifest.json"
+    export_manifest = {
+        "artifact_type": "latent_export",
+        "export_kind": "full_labeled_dataset",
+        "suite_name": "latent_export",
+        "suite_version": "v1",
+        "artifact_id": make_artifact_id(
+            suite_name="latent_export",
+            suite_version="v1",
+            checkpoint_id=checkpoint_meta["source_checkpoint_id"],
+            output_label=output_dir.name,
+        ),
+        **checkpoint_meta,
+        "analysis_only": False,
+        "script_path": str(Path(__file__).resolve()),
+        "cli_args": list(sys.argv[1:]),
+        "source_dataset_repo_id": cfg.dataset_repo_id,
+        "source_dataset_root": cfg.dataset_root,
+        "episodes": cfg.episodes,
+        "output_repo_id": cfg.output_repo_id,
+        "output_path": str(output_dir),
+        "feature_prefix": cfg.feature_prefix,
+        "feature_names": {
+            name: f"{cfg.feature_prefix}.{name}" for name in plan["representations"]
+        },
+        "valid_feature_name": f"{cfg.feature_prefix}.valid",
+        "stats_feature_names": [
+            f"{cfg.feature_prefix}.{name}"
+            for name, info in feature_infos.items()
+            if np.issubdtype(np.dtype(info["dtype"]), np.floating)
+        ],
+        "delta_timestamps": plan["delta_timestamps"],
+        "num_rows": int(source_dataset.meta.total_frames),
+        "num_valid_labels": int(valid_supervision.sum()),
+        "label_manifest_path": str(label_manifest_path),
+    }
+    register_artifact(
+        manifest_path=export_manifest_path,
+        manifest=export_manifest,
+        registry_candidates=[output_dir, cfg.policy.pretrained_path, cfg.dataset_root],
+    )
 
     logging.info("Finished export to %s", relabeled_dataset.root)
-    logging.info("Manifest written to %s", manifest_path)
+    logging.info("Manifests written to %s and %s", label_manifest_path, export_manifest_path)
 
 
 @parser.wrap()

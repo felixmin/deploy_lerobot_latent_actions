@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from _artifact_registry import infer_checkpoint_metadata, make_artifact_id, register_artifact
 
 PROGRESS_LOG_EVERY_BATCHES = 50
 SUPPORTED_LATENT_FORMATS = {"continuous", "codebook_vectors"}
@@ -452,7 +459,49 @@ def analyze_spcfc(args: argparse.Namespace) -> None:
         )
     readme_lines.extend(["", "## Distribution Plots"])
     readme_lines.extend(f"- `{name}`" for name in plot_artifacts)
-    (output_dir / "README.md").write_text("\n".join(readme_lines) + "\n")
+    readme_path = output_dir / "README.md"
+    readme_path.write_text("\n".join(readme_lines) + "\n")
+
+    checkpoint_meta = infer_checkpoint_metadata(args.policy_path.resolve())
+    summary_rows = summary_df.to_dict(orient="records")
+    headline_metrics = {
+        "offset_frames": int(args.offset_frames),
+        "offset_seconds": float(offset_seconds),
+    }
+    for row in summary_rows:
+        latent_format = str(row["latent_format"])
+        headline_metrics[f"{latent_format}_mean"] = float(row["mean"])
+        headline_metrics[f"{latent_format}_median"] = float(row["median"])
+        headline_metrics[f"{latent_format}_p95"] = float(row["p95"])
+
+    analysis_manifest = {
+        "artifact_type": "latent_analysis",
+        "analysis_kind": "spcfc",
+        "suite_name": "spcfc",
+        "suite_version": "v1",
+        "artifact_id": make_artifact_id(
+            suite_name="spcfc",
+            suite_version="v1",
+            checkpoint_id=checkpoint_meta["source_checkpoint_id"],
+            output_label=output_dir.name,
+        ),
+        **checkpoint_meta,
+        "parent_export_artifact_id": None,
+        "parent_export_manifest_path": None,
+        "input_dataset_root": args.dataset_root,
+        "input_dataset_repo_id": args.dataset_repo_id,
+        "script_path": str(Path(__file__).resolve()),
+        "cli_args": list(sys.argv[1:]),
+        "output_path": str(output_dir),
+        "summary_path": str(output_dir / "summary.json"),
+        "readme_path": str(readme_path),
+        "headline_metrics": headline_metrics,
+    }
+    register_artifact(
+        manifest_path=output_dir / "analysis_manifest.json",
+        manifest=analysis_manifest,
+        registry_candidates=[output_dir, args.policy_path, args.dataset_root],
+    )
 
 
 def main() -> None:

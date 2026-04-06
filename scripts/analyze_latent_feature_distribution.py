@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,12 @@ from sklearn.metrics import mean_squared_error, mutual_info_score, normalized_mu
 from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from _artifact_registry import infer_checkpoint_metadata, load_export_manifest, make_artifact_id, register_artifact
 
 
 def parse_hidden_dims(raw: str) -> tuple[int, ...]:
@@ -1156,6 +1163,13 @@ def main() -> None:
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    export_manifest = load_export_manifest(dataset_root)
+    checkpoint_meta = infer_checkpoint_metadata(
+        None
+        if export_manifest is None
+        else export_manifest.get("source_checkpoint_path") or export_manifest.get("policy_path")
+    )
+
     info = load_info(dataset_root)
     dataset = make_dataset(dataset_root)
 
@@ -1597,7 +1611,83 @@ def main() -> None:
         ]
     )
     summary_lines.extend(f"- `{artifact}`" for artifact in sorted(probe_heatmap_artifacts))
-    (output_dir / "README.md").write_text("\n".join(summary_lines) + "\n")
+    readme_path = output_dir / "README.md"
+    readme_path.write_text("\n".join(summary_lines) + "\n")
+
+    def probe_metric(feature_set: str, target: str, metric: str) -> float | None:
+        rows = probe_summary_df[
+            (probe_summary_df["feature_set"] == feature_set) & (probe_summary_df["target"] == target)
+        ]
+        if rows.shape[0] == 0:
+            return None
+        return float(rows.iloc[0][metric])
+
+    def bucket_metric(feature_set: str, target: str, metric: str) -> float | None:
+        rows = action_bucket_summary_df[
+            (action_bucket_summary_df["feature_set"] == feature_set) & (action_bucket_summary_df["target"] == target)
+        ]
+        if rows.shape[0] == 0:
+            return None
+        return float(rows.iloc[0][metric])
+
+    analysis_manifest = {
+        "artifact_type": "latent_analysis",
+        "analysis_kind": "latent_core",
+        "suite_name": "latent_core",
+        "suite_version": "v1",
+        "artifact_id": make_artifact_id(
+            suite_name="latent_core",
+            suite_version="v1",
+            checkpoint_id=checkpoint_meta["source_checkpoint_id"],
+            output_label=output_dir.name,
+        ),
+        **checkpoint_meta,
+        "parent_export_artifact_id": None if export_manifest is None else export_manifest.get("artifact_id"),
+        "parent_export_manifest_path": None if export_manifest is None else export_manifest.get("manifest_path"),
+        "input_dataset_root": str(dataset_root),
+        "input_dataset_repo_id": None if export_manifest is None else export_manifest.get("output_repo_id"),
+        "script_path": str(Path(__file__).resolve()),
+        "cli_args": list(sys.argv[1:]),
+        "feature_prefix": args.feature_prefix,
+        "output_path": str(output_dir),
+        "summary_path": str(output_dir / "summary.json"),
+        "readme_path": str(readme_path),
+        "headline_metrics": {
+            "probe_split": args.probe_split,
+            "probe_model": args.probe_model,
+            "continuous_current_mean_r2": probe_metric("continuous", "current_action", "mean_r2"),
+            "continuous_current_mean_mse": probe_metric("continuous", "current_action", "mean_mse"),
+            "continuous_future_mean_r2": probe_metric("continuous", "future_action_mean", "mean_r2"),
+            "continuous_future_mean_mse": probe_metric("continuous", "future_action_mean", "mean_mse"),
+            "id_sequence_current_mean_r2": probe_metric("id_sequence", "current_action", "mean_r2"),
+            "id_sequence_current_mean_mse": probe_metric("id_sequence", "current_action", "mean_mse"),
+            "id_sequence_future_mean_r2": probe_metric("id_sequence", "future_action_mean", "mean_r2"),
+            "id_sequence_future_mean_mse": probe_metric("id_sequence", "future_action_mean", "mean_mse"),
+            "continuous_kmeans_current_mean_variance_explained": bucket_metric(
+                "continuous_kmeans", "current_action", "mean_variance_explained"
+            ),
+            "continuous_kmeans_future_mean_variance_explained": bucket_metric(
+                "continuous_kmeans", "future_action_mean", "mean_variance_explained"
+            ),
+            "id_sequence_current_mean_variance_explained": bucket_metric(
+                "id_sequence", "current_action", "mean_variance_explained"
+            ),
+            "id_sequence_future_mean_variance_explained": bucket_metric(
+                "id_sequence", "future_action_mean", "mean_variance_explained"
+            ),
+            "top_mi": None if action_mi_ranking_df is None or action_mi_ranking_df.shape[0] == 0 else float(action_mi_ranking_df.iloc[0]["mi"]),
+            "top_nmi": None if action_mi_ranking_df is None or action_mi_ranking_df.shape[0] == 0 else float(action_mi_ranking_df.iloc[0]["nmi"]),
+        },
+    }
+    register_artifact(
+        manifest_path=output_dir / "analysis_manifest.json",
+        manifest=analysis_manifest,
+        registry_candidates=[
+            output_dir,
+            dataset_root,
+            checkpoint_meta["source_checkpoint_path"],
+        ],
+    )
 
 
 if __name__ == "__main__":
