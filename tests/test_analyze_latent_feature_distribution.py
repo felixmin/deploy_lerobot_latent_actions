@@ -16,6 +16,16 @@ def test_extract_valid_episode_index_matches_valid_rows():
     assert result.tolist() == [0, 0, 1, 1, 1]
 
 
+def test_extract_valid_progress_context_tracks_position_and_episode_length():
+    valid = np.array([1, 1, 0, 1, 1, 1, 0], dtype=np.int64)
+    episode_index = np.array([0, 0, 0, 1, 1, 1, 1], dtype=np.int64)
+
+    progress_index, episode_lengths = analysis.extract_valid_progress_context(valid, episode_index)
+
+    assert progress_index.tolist() == [0, 1, 0, 1, 2]
+    assert episode_lengths.tolist() == [2, 2, 3, 3, 3]
+
+
 def test_derive_action_targets_truncates_to_valid_prefix():
     actions = np.arange(10, dtype=np.float32).reshape(5, 2)
     valid = np.array([1, 1, 0, 0, 0], dtype=np.int64)
@@ -112,6 +122,38 @@ def test_compute_bucket_action_statistics_recovers_perfect_bucket_means():
     assert stats_df["bucket_label"].tolist() == ["left", "right"]
     assert abs(float(summary["mean_variance_explained"]) - 1.0) < 1e-6
     assert abs(float(summary["mean_within_bucket_std"])) < 1e-6
+
+
+def test_compute_bucket_context_statistics_distinguishes_reused_vs_episode_local_buckets():
+    bucket_index = np.array([0, 0, 1, 1, 0, 0, 0, 0], dtype=np.int64)
+    bucket_names = np.array(["reused", "episode_local"], dtype=object)
+    valid_episode_index = np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.int64)
+    valid_frame_index = np.array([0, 1, 2, 3, 0, 1, 2, 3], dtype=np.int64)
+    valid_progress_index = np.array([0, 1, 2, 3, 0, 1, 2, 3], dtype=np.int64)
+    valid_episode_lengths = np.array([4, 4, 4, 4, 4, 4, 4, 4], dtype=np.int64)
+
+    stats_df, summary = analysis.compute_bucket_context_statistics(
+        bucket_index=bucket_index,
+        bucket_names=bucket_names,
+        valid_episode_index=valid_episode_index,
+        valid_frame_index=valid_frame_index,
+        valid_progress_index=valid_progress_index,
+        valid_episode_lengths=valid_episode_lengths,
+        progress_bins=4,
+    )
+
+    reused = stats_df[stats_df["bucket_label"] == "reused"].iloc[0]
+    local = stats_df[stats_df["bucket_label"] == "episode_local"].iloc[0]
+
+    assert float(reused["episode_coverage"]) == 1.0
+    assert float(local["episode_coverage"]) == 0.5
+    assert abs(float(reused["max_episode_fraction"]) - (4.0 / 6.0)) < 1e-6
+    assert float(local["max_episode_fraction"]) == 1.0
+    assert float(reused["mean_run_length"]) == 3.0
+    assert float(local["mean_run_length"]) == 2.0
+    assert float(reused["progress_bin_coverage"]) == 1.0
+    assert float(local["progress_bin_coverage"]) == 0.5
+    assert 0.0 <= float(summary["bucket_episode_nmi"]) <= 1.0
 
 
 def test_make_continuous_bucket_spec_assigns_two_clusters():

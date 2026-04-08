@@ -15,7 +15,6 @@ import torch
 
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.datasets.compute_stats import compute_episode_stats
 from lerobot.datasets.dataset_tools import add_features
 from lerobot.datasets.io_utils import write_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -168,8 +167,14 @@ def _compute_float_feature_stats(
     if not valid_rows.any():
         return {}
 
-    float_feature_data = {}
-    float_feature_infos = {}
+    quantiles = {
+        "q01": 0.01,
+        "q10": 0.10,
+        "q50": 0.50,
+        "q90": 0.90,
+        "q99": 0.99,
+    }
+    float_feature_stats = {}
     for name, info in feature_infos.items():
         dtype = np.dtype(info["dtype"])
         if not np.issubdtype(dtype, np.floating):
@@ -177,16 +182,22 @@ def _compute_float_feature_stats(
         values = label_arrays[name][valid_rows]
         if values.shape[0] == 0:
             continue
-        float_feature_data[name] = values
-        float_feature_infos[name] = info
 
-    if not float_feature_data:
-        return {}
+        # Compute stats directly on valid rows while preserving the full latent shape
+        # after the batch axis, e.g. [4, 32] instead of collapsing to [32].
+        values64 = values.astype(np.float64, copy=False)
+        stats = {
+            "min": values.min(axis=0),
+            "max": values.max(axis=0),
+            "mean": values64.mean(axis=0),
+            "std": values64.std(axis=0, ddof=0),
+            "count": np.array([values.shape[0]], dtype=np.int64),
+        }
+        for key, q in quantiles.items():
+            stats[key] = np.quantile(values64, q, axis=0)
+        float_feature_stats[name] = stats
 
-    return compute_episode_stats(
-        episode_data=float_feature_data,
-        features=float_feature_infos,
-    )
+    return float_feature_stats
 
 
 def export_latent_dataset(cfg: LatentExportConfig) -> None:

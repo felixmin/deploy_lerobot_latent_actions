@@ -10,7 +10,6 @@ import numpy as np
 import pandas as pd
 
 from lerobot.configs import parser
-from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from lerobot.datasets.io_utils import write_stats
 from lerobot.utils.utils import init_logging
 
@@ -58,6 +57,44 @@ def _series_to_valid_mask(series: pd.Series) -> np.ndarray:
     if mask.ndim > 1:
         mask = mask.reshape(mask.shape[0], -1)[:, 0]
     return mask.astype(bool, copy=False)
+
+
+def _compute_float_feature_stats(
+    *,
+    values_by_name: dict[str, list[np.ndarray]],
+    feature_infos: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, np.ndarray]]:
+    quantiles = {
+        "q01": 0.01,
+        "q10": 0.10,
+        "q50": 0.50,
+        "q90": 0.90,
+        "q99": 0.99,
+    }
+    float_feature_stats = {}
+    for name, value_chunks in values_by_name.items():
+        if not value_chunks:
+            continue
+
+        info = feature_infos[name]
+        dtype = np.dtype(info["dtype"])
+        if not np.issubdtype(dtype, np.floating):
+            continue
+
+        values = np.concatenate(value_chunks, axis=0)
+        values64 = values.astype(np.float64, copy=False)
+        stats = {
+            "min": values.min(axis=0),
+            "max": values.max(axis=0),
+            "mean": values64.mean(axis=0),
+            "std": values64.std(axis=0, ddof=0),
+            "count": np.array([values.shape[0]], dtype=np.int64),
+        }
+        for key, q in quantiles.items():
+            stats[key] = np.quantile(values64, q, axis=0)
+        float_feature_stats[name] = stats
+
+    return float_feature_stats
 
 
 def _resolve_latent_feature_names(
@@ -112,32 +149,29 @@ def backfill_latent_stats(cfg: BackfillLatentStatsConfig) -> None:
     if not data_files:
         raise FileNotFoundError(f"No parquet data files found under {cfg.dataset_root / 'data'}")
 
-    file_stats = []
+    feature_infos = {feature_name: info["features"][feature_name] for feature_name in float_feature_names}
+    values_by_name = {feature_name: [] for feature_name in float_feature_names}
     for parquet_path in data_files:
         frame = pd.read_parquet(parquet_path, columns=[valid_feature_name, *float_feature_names])
         valid_mask = _series_to_valid_mask(frame[valid_feature_name])
         if not valid_mask.any():
             continue
 
-        episode_data = {}
-        episode_features = {}
         for feature_name in float_feature_names:
-            feature_info = info["features"][feature_name]
+            feature_info = feature_infos[feature_name]
             dtype = np.dtype(feature_info["dtype"])
             shape = tuple(int(dim) for dim in feature_info["shape"])
             values = _series_to_array(frame[feature_name], shape=shape, dtype=dtype)[valid_mask]
             if values.shape[0] == 0:
                 continue
-            episode_data[feature_name] = values
-            episode_features[feature_name] = feature_info
+            values_by_name[feature_name].append(values)
 
-        if episode_data:
-            file_stats.append(compute_episode_stats(episode_data=episode_data, features=episode_features))
-
-    if not file_stats:
+    aggregated_stats = _compute_float_feature_stats(
+        values_by_name=values_by_name,
+        feature_infos=feature_infos,
+    )
+    if not aggregated_stats:
         raise ValueError("No valid latent rows found; could not compute latent stats.")
-
-    aggregated_stats = aggregate_stats(file_stats)
     existing_stats = _load_json(stats_path) if stats_path.exists() else {}
     existing_stats.update(aggregated_stats)
     write_stats(existing_stats, cfg.dataset_root)

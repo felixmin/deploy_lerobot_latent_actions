@@ -158,6 +158,12 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="How many top buckets by count to keep in the JSON and README summaries.",
     )
+    parser.add_argument(
+        "--bucket-progress-bins",
+        type=int,
+        default=10,
+        help="Number of normalized within-episode progress bins used for bucket context coverage.",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     return parser.parse_args()
 
@@ -196,12 +202,15 @@ def load_float_array(dataset: ds.Dataset, column_name: str, valid_col: str) -> n
     return np.stack([np.stack(row, axis=0) for row in obj], axis=0).astype(np.float32, copy=False)
 
 
-def load_action_context(dataset: ds.Dataset, action_col: str, valid_col: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    table = dataset.to_table(columns=[action_col, valid_col, "episode_index"])
+def load_action_context(
+    dataset: ds.Dataset, action_col: str, valid_col: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    table = dataset.to_table(columns=[action_col, valid_col, "episode_index", "frame_index"])
     actions = np.stack(table[action_col].to_numpy(zero_copy_only=False)).astype(np.float32, copy=False)
     valid = table[valid_col].to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
     episode_index = table["episode_index"].to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
-    return actions, valid, episode_index
+    frame_index = table["frame_index"].to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+    return actions, valid, episode_index, frame_index
 
 
 def ensure_2d_rows(arr: np.ndarray) -> np.ndarray:
@@ -349,6 +358,45 @@ def extract_valid_episode_index(valid: np.ndarray, episode_index: np.ndarray) ->
     if not chunks:
         return np.empty((0,), dtype=np.int64)
     return np.concatenate(chunks, axis=0).astype(np.int64, copy=False)
+
+
+def extract_valid_scalar_context(values: np.ndarray, valid: np.ndarray, episode_index: np.ndarray) -> np.ndarray:
+    chunks = []
+    for start, end in episode_ranges(episode_index):
+        valid_ep = valid[start:end]
+        n_valid = int(np.sum(valid_ep == 1))
+        if not np.all(valid_ep[:n_valid] == 1):
+            raise ValueError("Expected valid rows to be contiguous at the start of each episode.")
+        if not np.all(valid_ep[n_valid:] == 0):
+            raise ValueError("Expected invalid rows to be contiguous at the end of each episode.")
+        if n_valid == 0:
+            continue
+        chunks.append(values[start : start + n_valid])
+    if not chunks:
+        return np.empty((0,), dtype=values.dtype)
+    return np.concatenate(chunks, axis=0)
+
+
+def extract_valid_progress_context(valid: np.ndarray, episode_index: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    progress_idx_chunks = []
+    episode_len_chunks = []
+    for start, end in episode_ranges(episode_index):
+        valid_ep = valid[start:end]
+        n_valid = int(np.sum(valid_ep == 1))
+        if not np.all(valid_ep[:n_valid] == 1):
+            raise ValueError("Expected valid rows to be contiguous at the start of each episode.")
+        if not np.all(valid_ep[n_valid:] == 0):
+            raise ValueError("Expected invalid rows to be contiguous at the end of each episode.")
+        if n_valid == 0:
+            continue
+        progress_idx_chunks.append(np.arange(n_valid, dtype=np.int64))
+        episode_len_chunks.append(np.full(n_valid, n_valid, dtype=np.int64))
+    if not progress_idx_chunks:
+        return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
+    return (
+        np.concatenate(progress_idx_chunks, axis=0).astype(np.int64, copy=False),
+        np.concatenate(episode_len_chunks, axis=0).astype(np.int64, copy=False),
+    )
 
 
 def quantile_bin_1d(values: np.ndarray, n_bins: int) -> tuple[np.ndarray, np.ndarray]:
@@ -648,6 +696,168 @@ def compute_bucket_action_statistics(
     return stats_df, summary
 
 
+def _normalized_progress_bins(
+    progress_index: np.ndarray,
+    episode_lengths: np.ndarray,
+    n_bins: int,
+) -> np.ndarray:
+    if progress_index.shape != episode_lengths.shape:
+        raise ValueError("Progress indices and episode lengths must have the same shape.")
+    if n_bins < 1:
+        raise ValueError("Progress bins must be >= 1.")
+    if progress_index.shape[0] == 0:
+        return np.empty((0,), dtype=np.int64)
+    denom = np.maximum(episode_lengths.astype(np.float64, copy=False) - 1.0, 1.0)
+    normalized = progress_index.astype(np.float64, copy=False) / denom
+    bins = np.floor(normalized * float(n_bins)).astype(np.int64, copy=False)
+    return np.clip(bins, 0, n_bins - 1)
+
+
+def compute_bucket_context_statistics(
+    *,
+    bucket_index: np.ndarray,
+    bucket_names: np.ndarray,
+    valid_episode_index: np.ndarray,
+    valid_frame_index: np.ndarray,
+    valid_progress_index: np.ndarray,
+    valid_episode_lengths: np.ndarray,
+    progress_bins: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if bucket_index.shape[0] != valid_episode_index.shape[0]:
+        raise ValueError("Bucket indices and episode indices must have the same number of rows.")
+    if valid_frame_index.shape[0] != bucket_index.shape[0]:
+        raise ValueError("Bucket indices and frame indices must have the same number of rows.")
+    if valid_progress_index.shape[0] != bucket_index.shape[0]:
+        raise ValueError("Bucket indices and progress indices must have the same number of rows.")
+    if valid_episode_lengths.shape[0] != bucket_index.shape[0]:
+        raise ValueError("Bucket indices and episode lengths must have the same number of rows.")
+    if bucket_names.ndim != 1:
+        raise ValueError(f"Expected 1D bucket names array, got shape={bucket_names.shape}.")
+
+    total_rows = int(bucket_index.shape[0])
+    if total_rows == 0:
+        empty_df = pd.DataFrame(
+            columns=[
+                "bucket_id",
+                "bucket_label",
+                "count",
+                "fraction",
+                "unique_episodes",
+                "episode_coverage",
+                "max_episode_fraction",
+                "episode_perplexity",
+                "mean_run_length",
+                "max_run_length",
+                "adjacent_repeat_fraction",
+                "progress_bin_coverage",
+            ]
+        )
+        return empty_df, {
+            "total_rows": 0,
+            "total_buckets": int(bucket_names.shape[0]),
+            "active_buckets": 0,
+            "weighted_mean_episode_coverage": 0.0,
+            "weighted_mean_max_episode_fraction": 0.0,
+            "weighted_mean_episode_perplexity": 0.0,
+            "weighted_mean_run_length": 0.0,
+            "weighted_max_run_length": 0.0,
+            "weighted_adjacent_repeat_fraction": 0.0,
+            "weighted_progress_bin_coverage": 0.0,
+            "bucket_episode_nmi": 0.0,
+        }
+
+    total_episodes = int(np.unique(valid_episode_index).shape[0])
+    progress_bin_index = _normalized_progress_bins(valid_progress_index, valid_episode_lengths, n_bins=progress_bins)
+    counts = np.bincount(bucket_index, minlength=int(bucket_names.shape[0]))
+    bucket_episode_nmi = float(normalized_mutual_info_score(bucket_index, valid_episode_index))
+
+    weighted_episode_coverage = 0.0
+    weighted_max_episode_fraction = 0.0
+    weighted_episode_perplexity = 0.0
+    weighted_mean_run_length = 0.0
+    weighted_max_run_length = 0.0
+    weighted_adjacent_repeat_fraction = 0.0
+    weighted_progress_bin_coverage = 0.0
+    rows: list[dict[str, Any]] = []
+
+    for bucket_id in np.flatnonzero(counts > 0).tolist():
+        bucket_rows = np.flatnonzero(bucket_index == bucket_id)
+        count = int(bucket_rows.shape[0])
+        fraction = float(count / total_rows)
+        bucket_eps = valid_episode_index[bucket_rows]
+        bucket_frames = valid_frame_index[bucket_rows]
+        bucket_progress_bins = progress_bin_index[bucket_rows]
+
+        unique_eps, episode_counts = np.unique(bucket_eps, return_counts=True)
+        probs = episode_counts.astype(np.float64, copy=False) / float(count)
+        entropy = -np.sum(np.where(probs > 0.0, probs * np.log(probs), 0.0))
+        episode_perplexity = float(np.exp(entropy))
+        max_episode_fraction = float(np.max(probs))
+        episode_coverage = float(unique_eps.shape[0] / max(total_episodes, 1))
+
+        run_lengths = []
+        run_start = 0
+        for idx in range(1, count):
+            same_episode = bucket_eps[idx] == bucket_eps[idx - 1]
+            consecutive_frame = bucket_frames[idx] == bucket_frames[idx - 1] + 1
+            if not (same_episode and consecutive_frame):
+                run_lengths.append(idx - run_start)
+                run_start = idx
+        run_lengths.append(count - run_start)
+        run_lengths_arr = np.asarray(run_lengths, dtype=np.int64)
+        adjacent_repeat_fraction = float(np.sum(np.maximum(run_lengths_arr - 1, 0)) / float(max(count - 1, 1)))
+        mean_run_length = float(np.mean(run_lengths_arr))
+        max_run_length = int(np.max(run_lengths_arr))
+        progress_bin_coverage = float(np.unique(bucket_progress_bins).shape[0] / float(max(progress_bins, 1)))
+
+        weighted_episode_coverage += episode_coverage * count
+        weighted_max_episode_fraction += max_episode_fraction * count
+        weighted_episode_perplexity += episode_perplexity * count
+        weighted_mean_run_length += mean_run_length * count
+        weighted_max_run_length += float(max_run_length) * count
+        weighted_adjacent_repeat_fraction += adjacent_repeat_fraction * count
+        weighted_progress_bin_coverage += progress_bin_coverage * count
+
+        rows.append(
+            {
+                "bucket_id": int(bucket_id),
+                "bucket_label": str(bucket_names[bucket_id]),
+                "count": count,
+                "fraction": fraction,
+                "unique_episodes": int(unique_eps.shape[0]),
+                "episode_coverage": episode_coverage,
+                "max_episode_fraction": max_episode_fraction,
+                "episode_perplexity": episode_perplexity,
+                "mean_run_length": mean_run_length,
+                "max_run_length": max_run_length,
+                "adjacent_repeat_fraction": adjacent_repeat_fraction,
+                "progress_bin_coverage": progress_bin_coverage,
+            }
+        )
+
+    stats_df = pd.DataFrame(rows).sort_values(
+        ["count", "episode_coverage", "max_episode_fraction"],
+        ascending=[False, False, True],
+        ignore_index=True,
+    )
+    summary = {
+        "total_rows": total_rows,
+        "total_buckets": int(bucket_names.shape[0]),
+        "active_buckets": int(np.sum(counts > 0)),
+        "weighted_mean_episode_coverage": float(weighted_episode_coverage / total_rows),
+        "weighted_mean_max_episode_fraction": float(weighted_max_episode_fraction / total_rows),
+        "weighted_mean_episode_perplexity": float(weighted_episode_perplexity / total_rows),
+        "weighted_mean_run_length": float(weighted_mean_run_length / total_rows),
+        "weighted_max_run_length": float(weighted_max_run_length / total_rows),
+        "weighted_adjacent_repeat_fraction": float(weighted_adjacent_repeat_fraction / total_rows),
+        "weighted_progress_bin_coverage": float(weighted_progress_bin_coverage / total_rows),
+        "bucket_episode_nmi": bucket_episode_nmi,
+        "progress_bins": int(progress_bins),
+        "total_episodes": total_episodes,
+    }
+    return stats_df, summary
+
+
 def make_discrete_bucket_spec(ids: np.ndarray, id_inverse: np.ndarray) -> dict[str, Any]:
     unique_labels, first_indices = np.unique(id_inverse, return_index=True)
     if unique_labels.shape[0] == 0:
@@ -779,6 +989,67 @@ def run_action_bucket_analysis(
         ignore_index=True,
     )
     summary_df.to_csv(output_dir / "action_bucket_summary.csv", index=False)
+    return summary_df, json_summary
+
+
+def run_bucket_context_analysis(
+    *,
+    bucket_specs: list[dict[str, Any]],
+    valid_episode_index: np.ndarray,
+    valid_frame_index: np.ndarray,
+    valid_progress_index: np.ndarray,
+    valid_episode_lengths: np.ndarray,
+    progress_bins: int,
+    output_dir: Path,
+    top_k: int,
+) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
+    summary_rows: list[dict[str, Any]] = []
+    json_summary: dict[str, dict[str, Any]] = {}
+
+    for bucket_spec in bucket_specs:
+        feature_set = str(bucket_spec["feature_set"])
+        bucket_index = np.asarray(bucket_spec["bucket_index"], dtype=np.int64)
+        bucket_names = np.asarray(bucket_spec["bucket_names"], dtype=object)
+        stats_df, feature_summary = compute_bucket_context_statistics(
+            bucket_index=bucket_index,
+            bucket_names=bucket_names,
+            valid_episode_index=valid_episode_index,
+            valid_frame_index=valid_frame_index,
+            valid_progress_index=valid_progress_index,
+            valid_episode_lengths=valid_episode_lengths,
+            progress_bins=progress_bins,
+        )
+        stats_path = output_dir / f"bucket_context__{feature_set}.csv"
+        stats_df.to_csv(stats_path, index=False)
+        summary_rows.append(
+            {
+                "feature_set": feature_set,
+                "bucket_kind": str(bucket_spec["bucket_kind"]),
+                "total_buckets": int(feature_summary["total_buckets"]),
+                "active_buckets": int(feature_summary["active_buckets"]),
+                "bucket_episode_nmi": float(feature_summary["bucket_episode_nmi"]),
+                "weighted_mean_episode_coverage": float(feature_summary["weighted_mean_episode_coverage"]),
+                "weighted_mean_max_episode_fraction": float(feature_summary["weighted_mean_max_episode_fraction"]),
+                "weighted_mean_episode_perplexity": float(feature_summary["weighted_mean_episode_perplexity"]),
+                "weighted_mean_run_length": float(feature_summary["weighted_mean_run_length"]),
+                "weighted_max_run_length": float(feature_summary["weighted_max_run_length"]),
+                "weighted_adjacent_repeat_fraction": float(feature_summary["weighted_adjacent_repeat_fraction"]),
+                "weighted_progress_bin_coverage": float(feature_summary["weighted_progress_bin_coverage"]),
+            }
+        )
+        json_summary[feature_set] = {
+            "bucket_kind": str(bucket_spec["bucket_kind"]),
+            **feature_summary,
+            "artifact": stats_path.name,
+            "top_rows": stats_df.head(top_k).to_dict(orient="records"),
+        }
+
+    summary_df = pd.DataFrame(summary_rows).sort_values(
+        ["weighted_mean_episode_coverage", "weighted_mean_max_episode_fraction"],
+        ascending=[False, True],
+        ignore_index=True,
+    )
+    summary_df.to_csv(output_dir / "bucket_context_summary.csv", index=False)
     return summary_df, json_summary
 
 
@@ -1158,6 +1429,8 @@ def main() -> None:
         raise ValueError("--bucket-kmeans-fit-samples must be >= 1.")
     if args.bucket_top_k < 1:
         raise ValueError("--bucket-top-k must be >= 1.")
+    if args.bucket_progress_bins < 1:
+        raise ValueError("--bucket-progress-bins must be >= 1.")
 
     dataset_root = args.dataset_root.resolve()
     output_dir = args.output_dir.resolve()
@@ -1199,10 +1472,12 @@ def main() -> None:
     valid_counts = load_valid_counts(dataset, valid_col)
     plot_valid_distribution(valid_counts, output_dir / "valid_distribution.png")
 
-    all_actions, all_valid, episode_index = load_action_context(dataset, action_col, valid_col)
+    all_actions, all_valid, episode_index, frame_index = load_action_context(dataset, action_col, valid_col)
     tail_counts = infer_episode_tail_counts(all_valid, episode_index)
     action_targets = derive_action_targets(all_actions, all_valid, episode_index, args.future_frames)
     valid_episode_index = extract_valid_episode_index(all_valid, episode_index)
+    valid_frame_index = extract_valid_scalar_context(frame_index, all_valid, episode_index).astype(np.int64, copy=False)
+    valid_progress_index, valid_episode_lengths = extract_valid_progress_context(all_valid, episode_index)
 
     continuous = load_float_array(dataset, continuous_col, valid_col)
     valid_frames = int(continuous.shape[0])
@@ -1210,6 +1485,8 @@ def main() -> None:
         raise ValueError(
             "Valid-row episode index alignment failed: action targets and latent arrays disagree on row count."
         )
+    if valid_frame_index.shape[0] != valid_frames or valid_progress_index.shape[0] != valid_frames:
+        raise ValueError("Valid-row frame/progress alignment failed: context arrays disagree on row count.")
 
     ids = None
     id_inverse = None
@@ -1370,6 +1647,16 @@ def main() -> None:
             output_dir=output_dir,
             top_k=args.bucket_top_k,
         )
+        bucket_context_summary_df, bucket_context_summary = run_bucket_context_analysis(
+            bucket_specs=bucket_specs,
+            valid_episode_index=valid_episode_index,
+            valid_frame_index=valid_frame_index,
+            valid_progress_index=valid_progress_index,
+            valid_episode_lengths=valid_episode_lengths,
+            progress_bins=args.bucket_progress_bins,
+            output_dir=output_dir,
+            top_k=args.bucket_top_k,
+        )
     else:
         action_bucket_summary_df = pd.DataFrame(
             columns=[
@@ -1387,6 +1674,24 @@ def main() -> None:
         )
         action_bucket_summary = {}
         action_bucket_summary_df.to_csv(output_dir / "action_bucket_summary.csv", index=False)
+        bucket_context_summary_df = pd.DataFrame(
+            columns=[
+                "feature_set",
+                "bucket_kind",
+                "total_buckets",
+                "active_buckets",
+                "bucket_episode_nmi",
+                "weighted_mean_episode_coverage",
+                "weighted_mean_max_episode_fraction",
+                "weighted_mean_episode_perplexity",
+                "weighted_mean_run_length",
+                "weighted_max_run_length",
+                "weighted_adjacent_repeat_fraction",
+                "weighted_progress_bin_coverage",
+            ]
+        )
+        bucket_context_summary = {}
+        bucket_context_summary_df.to_csv(output_dir / "bucket_context_summary.csv", index=False)
 
     probe_df = run_action_probes(
         ids=ids,
@@ -1515,6 +1820,10 @@ def main() -> None:
             "summary_rows": action_bucket_summary_df.to_dict(orient="records"),
             "by_feature_set": action_bucket_summary,
         },
+        "bucket_context": {
+            "summary_rows": bucket_context_summary_df.to_dict(orient="records"),
+            "by_feature_set": bucket_context_summary,
+        },
         "artifacts": sorted(p.name for p in output_dir.iterdir()),
     }
     save_json(output_dir / "summary.json", summary)
@@ -1599,6 +1908,14 @@ def main() -> None:
             )
     else:
         summary_lines.append("- No action bucket analysis was run.")
+    summary_lines.extend(["", "## Bucket Context"])
+    if bucket_context_summary_df.shape[0] > 0:
+        for row in bucket_context_summary_df.to_dict(orient="records"):
+            summary_lines.append(
+                f"- `{row['feature_set']}`: episode NMI `{row['bucket_episode_nmi']:.4f}`, weighted episode coverage `{row['weighted_mean_episode_coverage']:.4f}`, weighted max-episode fraction `{row['weighted_mean_max_episode_fraction']:.4f}`, weighted adjacent-repeat fraction `{row['weighted_adjacent_repeat_fraction']:.4f}`"
+            )
+    else:
+        summary_lines.append("- No bucket context analysis was run.")
     summary_lines.extend(
         [
             "",
@@ -1626,6 +1943,12 @@ def main() -> None:
         rows = action_bucket_summary_df[
             (action_bucket_summary_df["feature_set"] == feature_set) & (action_bucket_summary_df["target"] == target)
         ]
+        if rows.shape[0] == 0:
+            return None
+        return float(rows.iloc[0][metric])
+
+    def context_metric(feature_set: str, metric: str) -> float | None:
+        rows = bucket_context_summary_df[bucket_context_summary_df["feature_set"] == feature_set]
         if rows.shape[0] == 0:
             return None
         return float(rows.iloc[0][metric])
@@ -1674,6 +1997,14 @@ def main() -> None:
             ),
             "id_sequence_future_mean_variance_explained": bucket_metric(
                 "id_sequence", "future_action_mean", "mean_variance_explained"
+            ),
+            "continuous_kmeans_bucket_episode_nmi": context_metric("continuous_kmeans", "bucket_episode_nmi"),
+            "continuous_kmeans_weighted_episode_coverage": context_metric(
+                "continuous_kmeans", "weighted_mean_episode_coverage"
+            ),
+            "id_sequence_bucket_episode_nmi": context_metric("id_sequence", "bucket_episode_nmi"),
+            "id_sequence_weighted_episode_coverage": context_metric(
+                "id_sequence", "weighted_mean_episode_coverage"
             ),
             "top_mi": None if action_mi_ranking_df is None or action_mi_ranking_df.shape[0] == 0 else float(action_mi_ranking_df.iloc[0]["mi"]),
             "top_nmi": None if action_mi_ranking_df is None or action_mi_ranking_df.shape[0] == 0 else float(action_mi_ranking_df.iloc[0]["nmi"]),
