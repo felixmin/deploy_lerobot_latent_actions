@@ -156,6 +156,53 @@ def test_compute_bucket_context_statistics_distinguishes_reused_vs_episode_local
     assert 0.0 <= float(summary["bucket_episode_nmi"]) <= 1.0
 
 
+def test_make_action_kmeans_bucket_spec_assigns_two_clusters():
+    rng = np.random.default_rng(2)
+    cluster_a = rng.normal(loc=-2.0, scale=0.1, size=(20, 3)).astype(np.float32)
+    cluster_b = rng.normal(loc=2.0, scale=0.1, size=(20, 3)).astype(np.float32)
+    actions = np.concatenate([cluster_a, cluster_b], axis=0)
+
+    bucket_spec = analysis.make_action_kmeans_bucket_spec(
+        actions,
+        target_name="future_action_mean",
+        n_clusters=2,
+        fit_samples=40,
+        seed=0,
+    )
+
+    counts = np.sort(bucket_spec["bucket_counts"])
+    assert bucket_spec["action_target"] == "future_action_mean"
+    assert bucket_spec["action_bucket_kind"] == "kmeans"
+    assert int(bucket_spec["effective_clusters"]) == 2
+    assert counts.tolist() == [20, 20]
+
+
+def test_compute_action_to_latent_statistics_distinguishes_consistent_vs_fragmented_actions():
+    action_bucket_index = np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.int64)
+    action_bucket_names = np.array(["consistent", "fragmented"], dtype=object)
+    latent_bucket_index = np.array([0, 0, 0, 0, 0, 1, 2, 3], dtype=np.int64)
+    latent_bucket_names = np.array(["l0", "l1", "l2", "l3"], dtype=object)
+
+    stats_df, summary = analysis.compute_action_to_latent_statistics(
+        action_bucket_index=action_bucket_index,
+        action_bucket_names=action_bucket_names,
+        latent_bucket_index=latent_bucket_index,
+        latent_bucket_names=latent_bucket_names,
+    )
+
+    consistent = stats_df[stats_df["action_bucket_label"] == "consistent"].iloc[0]
+    fragmented = stats_df[stats_df["action_bucket_label"] == "fragmented"].iloc[0]
+
+    assert float(consistent["top_latent_fraction"]) == 1.0
+    assert int(consistent["active_latent_buckets"]) == 1
+    assert int(fragmented["active_latent_buckets"]) == 4
+    assert float(fragmented["top_latent_fraction"]) == 0.25
+    assert int(fragmented["latent_buckets_for_80pct_mass"]) == 4
+    assert float(summary["weighted_mean_top_latent_fraction"]) < 1.0
+    assert float(summary["latent_given_action_entropy"]) > 0.0
+    assert 0.0 <= float(summary["action_latent_nmi"]) <= 1.0
+
+
 def test_make_continuous_bucket_spec_assigns_two_clusters():
     rng = np.random.default_rng(0)
     cluster_a = rng.normal(loc=-3.0, scale=0.1, size=(24, 4)).astype(np.float32)

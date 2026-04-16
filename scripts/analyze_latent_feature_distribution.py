@@ -164,6 +164,18 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="Number of normalized within-episode progress bins used for bucket context coverage.",
     )
+    parser.add_argument(
+        "--action-bucket-kmeans-clusters",
+        type=int,
+        default=64,
+        help="Number of KMeans buckets used for reverse action-to-latent consistency analysis. Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--action-bucket-kmeans-fit-samples",
+        type=int,
+        default=50000,
+        help="Maximum number of rows used to fit the action-space KMeans model for reverse consistency analysis.",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     return parser.parse_args()
 
@@ -858,6 +870,195 @@ def compute_bucket_context_statistics(
     return stats_df, summary
 
 
+def _entropy_from_counts(counts: np.ndarray) -> float:
+    counts = np.asarray(counts, dtype=np.float64)
+    total = float(np.sum(counts))
+    if total <= 0.0:
+        return 0.0
+    probs = counts[counts > 0.0] / total
+    return float(-np.sum(probs * np.log(probs)))
+
+
+def make_action_kmeans_bucket_spec(
+    action_values: np.ndarray,
+    *,
+    target_name: str,
+    n_clusters: int,
+    fit_samples: int,
+    seed: int,
+) -> dict[str, Any]:
+    if n_clusters < 1:
+        raise ValueError("Action bucketing requires at least one cluster.")
+    if fit_samples < 1:
+        raise ValueError("Action bucketing requires at least one fit sample.")
+
+    n_rows = action_values.shape[0]
+    effective_clusters = min(int(n_clusters), int(n_rows))
+    rng = np.random.default_rng(seed)
+    fit_size = min(int(fit_samples), int(n_rows))
+    fit_idx = rng.choice(n_rows, size=fit_size, replace=False)
+
+    scaler = StandardScaler()
+    fit_values = scaler.fit_transform(action_values[fit_idx]).astype(np.float32, copy=False)
+    full_values = scaler.transform(action_values).astype(np.float32, copy=False)
+
+    batch_size = min(max(1024, 4 * effective_clusters), full_values.shape[0])
+    model = MiniBatchKMeans(
+        n_clusters=effective_clusters,
+        random_state=seed,
+        batch_size=batch_size,
+        n_init=3,
+        max_iter=100,
+    )
+    model.fit(fit_values)
+    bucket_index = model.predict(full_values).astype(np.int64, copy=False)
+    counts = np.bincount(bucket_index, minlength=effective_clusters).astype(np.int64, copy=False)
+    bucket_names = np.asarray([f"action_cluster_{bucket_id}" for bucket_id in range(effective_clusters)], dtype=object)
+    center_norms = np.linalg.norm(model.cluster_centers_.astype(np.float64, copy=False), axis=1)
+
+    return {
+        "action_target": target_name,
+        "action_bucket_kind": "kmeans",
+        "bucket_index": bucket_index,
+        "bucket_names": bucket_names,
+        "bucket_counts": counts,
+        "fit_rows": int(fit_size),
+        "requested_clusters": int(n_clusters),
+        "effective_clusters": int(effective_clusters),
+        "cluster_center_l2_norm_mean": float(np.mean(center_norms)),
+        "cluster_center_l2_norm_std": float(np.std(center_norms)),
+    }
+
+
+def compute_action_to_latent_statistics(
+    *,
+    action_bucket_index: np.ndarray,
+    action_bucket_names: np.ndarray,
+    latent_bucket_index: np.ndarray,
+    latent_bucket_names: np.ndarray,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if action_bucket_index.shape[0] != latent_bucket_index.shape[0]:
+        raise ValueError("Action bucket indices and latent bucket indices must have the same number of rows.")
+    if action_bucket_names.ndim != 1:
+        raise ValueError(f"Expected 1D action bucket names array, got shape={action_bucket_names.shape}.")
+    if latent_bucket_names.ndim != 1:
+        raise ValueError(f"Expected 1D latent bucket names array, got shape={latent_bucket_names.shape}.")
+
+    total_rows = int(action_bucket_index.shape[0])
+    if total_rows == 0:
+        empty_df = pd.DataFrame(
+            columns=[
+                "action_bucket_id",
+                "action_bucket_label",
+                "count",
+                "fraction",
+                "active_latent_buckets",
+                "top_latent_bucket_id",
+                "top_latent_bucket_label",
+                "top_latent_fraction",
+                "latent_entropy",
+                "latent_perplexity",
+                "latent_buckets_for_80pct_mass",
+            ]
+        )
+        return empty_df, {
+            "total_rows": 0,
+            "action_total_buckets": int(action_bucket_names.shape[0]),
+            "action_active_buckets": 0,
+            "latent_total_buckets": int(latent_bucket_names.shape[0]),
+            "latent_active_buckets": 0,
+            "action_latent_nmi": 0.0,
+            "latent_given_action_entropy": 0.0,
+            "action_given_latent_entropy": 0.0,
+            "weighted_mean_active_latent_buckets": 0.0,
+            "weighted_mean_top_latent_fraction": 0.0,
+            "weighted_mean_latent_entropy": 0.0,
+            "weighted_mean_latent_perplexity": 0.0,
+            "weighted_mean_latent_buckets_for_80pct_mass": 0.0,
+        }
+
+    action_counts = np.bincount(action_bucket_index, minlength=int(action_bucket_names.shape[0])).astype(
+        np.int64, copy=False
+    )
+    latent_counts_global = np.bincount(latent_bucket_index, minlength=int(latent_bucket_names.shape[0])).astype(
+        np.int64, copy=False
+    )
+    mi = float(mutual_info_score(action_bucket_index, latent_bucket_index))
+    action_entropy = _entropy_from_counts(action_counts)
+    latent_entropy = _entropy_from_counts(latent_counts_global)
+    action_latent_nmi = float(normalized_mutual_info_score(action_bucket_index, latent_bucket_index))
+
+    weighted_active_latent_buckets = 0.0
+    weighted_top_latent_fraction = 0.0
+    weighted_latent_entropy = 0.0
+    weighted_latent_perplexity = 0.0
+    weighted_latent_buckets_for_80pct_mass = 0.0
+    rows: list[dict[str, Any]] = []
+
+    for action_bucket_id in np.flatnonzero(action_counts > 0).tolist():
+        bucket_rows = np.flatnonzero(action_bucket_index == action_bucket_id)
+        count = int(bucket_rows.shape[0])
+        fraction = float(count / total_rows)
+        latent_counts = np.bincount(
+            latent_bucket_index[bucket_rows], minlength=int(latent_bucket_names.shape[0])
+        ).astype(np.int64, copy=False)
+        active_latent_buckets = int(np.sum(latent_counts > 0))
+        top_latent_bucket_id = int(np.argmax(latent_counts))
+        top_latent_fraction = float(latent_counts[top_latent_bucket_id] / float(count))
+        bucket_latent_entropy = _entropy_from_counts(latent_counts)
+        bucket_latent_perplexity = float(np.exp(bucket_latent_entropy))
+        sorted_counts = np.sort(latent_counts[latent_counts > 0])[::-1]
+        if sorted_counts.shape[0] == 0:
+            latent_buckets_for_80pct_mass = 0
+        else:
+            coverage_counts = np.cumsum(sorted_counts, dtype=np.int64)
+            latent_buckets_for_80pct_mass = int(np.searchsorted(coverage_counts, int(np.ceil(0.8 * count))) + 1)
+
+        weighted_active_latent_buckets += active_latent_buckets * count
+        weighted_top_latent_fraction += top_latent_fraction * count
+        weighted_latent_entropy += bucket_latent_entropy * count
+        weighted_latent_perplexity += bucket_latent_perplexity * count
+        weighted_latent_buckets_for_80pct_mass += float(latent_buckets_for_80pct_mass) * count
+
+        rows.append(
+            {
+                "action_bucket_id": int(action_bucket_id),
+                "action_bucket_label": str(action_bucket_names[action_bucket_id]),
+                "count": count,
+                "fraction": fraction,
+                "active_latent_buckets": active_latent_buckets,
+                "top_latent_bucket_id": top_latent_bucket_id,
+                "top_latent_bucket_label": str(latent_bucket_names[top_latent_bucket_id]),
+                "top_latent_fraction": top_latent_fraction,
+                "latent_entropy": bucket_latent_entropy,
+                "latent_perplexity": bucket_latent_perplexity,
+                "latent_buckets_for_80pct_mass": latent_buckets_for_80pct_mass,
+            }
+        )
+
+    stats_df = pd.DataFrame(rows).sort_values(
+        ["top_latent_fraction", "latent_perplexity", "active_latent_buckets"],
+        ascending=[False, True, True],
+        ignore_index=True,
+    )
+    summary = {
+        "total_rows": total_rows,
+        "action_total_buckets": int(action_bucket_names.shape[0]),
+        "action_active_buckets": int(np.sum(action_counts > 0)),
+        "latent_total_buckets": int(latent_bucket_names.shape[0]),
+        "latent_active_buckets": int(np.sum(latent_counts_global > 0)),
+        "action_latent_nmi": action_latent_nmi,
+        "latent_given_action_entropy": float(weighted_latent_entropy / total_rows),
+        "action_given_latent_entropy": float(max(action_entropy - mi, 0.0)),
+        "weighted_mean_active_latent_buckets": float(weighted_active_latent_buckets / total_rows),
+        "weighted_mean_top_latent_fraction": float(weighted_top_latent_fraction / total_rows),
+        "weighted_mean_latent_entropy": float(weighted_latent_entropy / total_rows),
+        "weighted_mean_latent_perplexity": float(weighted_latent_perplexity / total_rows),
+        "weighted_mean_latent_buckets_for_80pct_mass": float(weighted_latent_buckets_for_80pct_mass / total_rows),
+    }
+    return stats_df, summary
+
+
 def make_discrete_bucket_spec(ids: np.ndarray, id_inverse: np.ndarray) -> dict[str, Any]:
     unique_labels, first_indices = np.unique(id_inverse, return_index=True)
     if unique_labels.shape[0] == 0:
@@ -1050,6 +1251,80 @@ def run_bucket_context_analysis(
         ignore_index=True,
     )
     summary_df.to_csv(output_dir / "bucket_context_summary.csv", index=False)
+    return summary_df, json_summary
+
+
+def run_action_to_latent_analysis(
+    *,
+    action_bucket_specs: list[dict[str, Any]],
+    latent_bucket_specs: list[dict[str, Any]],
+    output_dir: Path,
+    top_k: int,
+) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
+    summary_rows: list[dict[str, Any]] = []
+    json_summary: dict[str, dict[str, Any]] = {}
+
+    for action_bucket_spec in action_bucket_specs:
+        action_target = str(action_bucket_spec["action_target"])
+        action_bucket_index = np.asarray(action_bucket_spec["bucket_index"], dtype=np.int64)
+        action_bucket_names = np.asarray(action_bucket_spec["bucket_names"], dtype=object)
+        target_summary: dict[str, Any] = {
+            "action_bucket_kind": str(action_bucket_spec["action_bucket_kind"]),
+            "action_total_buckets": int(action_bucket_names.shape[0]),
+            "action_active_buckets": int(np.sum(np.asarray(action_bucket_spec["bucket_counts"], dtype=np.int64) > 0)),
+            "latent_feature_sets": {},
+        }
+        for key in ("fit_rows", "requested_clusters", "effective_clusters", "cluster_center_l2_norm_mean", "cluster_center_l2_norm_std"):
+            if key in action_bucket_spec:
+                target_summary[key] = action_bucket_spec[key]
+
+        for latent_bucket_spec in latent_bucket_specs:
+            feature_set = str(latent_bucket_spec["feature_set"])
+            stats_df, pair_summary = compute_action_to_latent_statistics(
+                action_bucket_index=action_bucket_index,
+                action_bucket_names=action_bucket_names,
+                latent_bucket_index=np.asarray(latent_bucket_spec["bucket_index"], dtype=np.int64),
+                latent_bucket_names=np.asarray(latent_bucket_spec["bucket_names"], dtype=object),
+            )
+            stats_path = output_dir / f"action_to_latent__{action_target}__to__{feature_set}.csv"
+            stats_df.to_csv(stats_path, index=False)
+            summary_rows.append(
+                {
+                    "action_target": action_target,
+                    "action_bucket_kind": str(action_bucket_spec["action_bucket_kind"]),
+                    "action_total_buckets": int(pair_summary["action_total_buckets"]),
+                    "action_active_buckets": int(pair_summary["action_active_buckets"]),
+                    "latent_feature_set": feature_set,
+                    "latent_bucket_kind": str(latent_bucket_spec["bucket_kind"]),
+                    "latent_total_buckets": int(pair_summary["latent_total_buckets"]),
+                    "latent_active_buckets": int(pair_summary["latent_active_buckets"]),
+                    "action_latent_nmi": float(pair_summary["action_latent_nmi"]),
+                    "latent_given_action_entropy": float(pair_summary["latent_given_action_entropy"]),
+                    "action_given_latent_entropy": float(pair_summary["action_given_latent_entropy"]),
+                    "weighted_mean_active_latent_buckets": float(pair_summary["weighted_mean_active_latent_buckets"]),
+                    "weighted_mean_top_latent_fraction": float(pair_summary["weighted_mean_top_latent_fraction"]),
+                    "weighted_mean_latent_entropy": float(pair_summary["weighted_mean_latent_entropy"]),
+                    "weighted_mean_latent_perplexity": float(pair_summary["weighted_mean_latent_perplexity"]),
+                    "weighted_mean_latent_buckets_for_80pct_mass": float(
+                        pair_summary["weighted_mean_latent_buckets_for_80pct_mass"]
+                    ),
+                }
+            )
+            target_summary["latent_feature_sets"][feature_set] = {
+                "latent_bucket_kind": str(latent_bucket_spec["bucket_kind"]),
+                **pair_summary,
+                "artifact": stats_path.name,
+                "top_rows": stats_df.head(top_k).to_dict(orient="records"),
+            }
+
+        json_summary[action_target] = target_summary
+
+    summary_df = pd.DataFrame(summary_rows).sort_values(
+        ["weighted_mean_top_latent_fraction", "latent_given_action_entropy"],
+        ascending=[False, True],
+        ignore_index=True,
+    )
+    summary_df.to_csv(output_dir / "action_to_latent_summary.csv", index=False)
     return summary_df, json_summary
 
 
@@ -1639,6 +1914,18 @@ def main() -> None:
                 seed=args.seed,
             )
         )
+    action_bucket_specs = []
+    if args.action_bucket_kmeans_clusters > 0:
+        for target_name, target_values in action_targets.items():
+            action_bucket_specs.append(
+                make_action_kmeans_bucket_spec(
+                    target_values,
+                    target_name=target_name,
+                    n_clusters=args.action_bucket_kmeans_clusters,
+                    fit_samples=args.action_bucket_kmeans_fit_samples,
+                    seed=args.seed,
+                )
+            )
 
     if bucket_specs:
         action_bucket_summary_df, action_bucket_summary = run_action_bucket_analysis(
@@ -1657,6 +1944,36 @@ def main() -> None:
             output_dir=output_dir,
             top_k=args.bucket_top_k,
         )
+        if action_bucket_specs:
+            action_to_latent_summary_df, action_to_latent_summary = run_action_to_latent_analysis(
+                action_bucket_specs=action_bucket_specs,
+                latent_bucket_specs=bucket_specs,
+                output_dir=output_dir,
+                top_k=args.bucket_top_k,
+            )
+        else:
+            action_to_latent_summary_df = pd.DataFrame(
+                columns=[
+                    "action_target",
+                    "action_bucket_kind",
+                    "action_total_buckets",
+                    "action_active_buckets",
+                    "latent_feature_set",
+                    "latent_bucket_kind",
+                    "latent_total_buckets",
+                    "latent_active_buckets",
+                    "action_latent_nmi",
+                    "latent_given_action_entropy",
+                    "action_given_latent_entropy",
+                    "weighted_mean_active_latent_buckets",
+                    "weighted_mean_top_latent_fraction",
+                    "weighted_mean_latent_entropy",
+                    "weighted_mean_latent_perplexity",
+                    "weighted_mean_latent_buckets_for_80pct_mass",
+                ]
+            )
+            action_to_latent_summary = {}
+            action_to_latent_summary_df.to_csv(output_dir / "action_to_latent_summary.csv", index=False)
     else:
         action_bucket_summary_df = pd.DataFrame(
             columns=[
@@ -1692,6 +2009,28 @@ def main() -> None:
         )
         bucket_context_summary = {}
         bucket_context_summary_df.to_csv(output_dir / "bucket_context_summary.csv", index=False)
+        action_to_latent_summary_df = pd.DataFrame(
+            columns=[
+                "action_target",
+                "action_bucket_kind",
+                "action_total_buckets",
+                "action_active_buckets",
+                "latent_feature_set",
+                "latent_bucket_kind",
+                "latent_total_buckets",
+                "latent_active_buckets",
+                "action_latent_nmi",
+                "latent_given_action_entropy",
+                "action_given_latent_entropy",
+                "weighted_mean_active_latent_buckets",
+                "weighted_mean_top_latent_fraction",
+                "weighted_mean_latent_entropy",
+                "weighted_mean_latent_perplexity",
+                "weighted_mean_latent_buckets_for_80pct_mass",
+            ]
+        )
+        action_to_latent_summary = {}
+        action_to_latent_summary_df.to_csv(output_dir / "action_to_latent_summary.csv", index=False)
 
     probe_df = run_action_probes(
         ids=ids,
@@ -1824,6 +2163,10 @@ def main() -> None:
             "summary_rows": bucket_context_summary_df.to_dict(orient="records"),
             "by_feature_set": bucket_context_summary,
         },
+        "action_to_latent": {
+            "summary_rows": action_to_latent_summary_df.to_dict(orient="records"),
+            "by_action_target": action_to_latent_summary,
+        },
         "artifacts": sorted(p.name for p in output_dir.iterdir()),
     }
     save_json(output_dir / "summary.json", summary)
@@ -1916,6 +2259,14 @@ def main() -> None:
             )
     else:
         summary_lines.append("- No bucket context analysis was run.")
+    summary_lines.extend(["", "## Action-to-Latent Consistency"])
+    if action_to_latent_summary_df.shape[0] > 0:
+        for row in action_to_latent_summary_df.to_dict(orient="records"):
+            summary_lines.append(
+                f"- `{row['action_target']}` -> `{row['latent_feature_set']}`: top-latent fraction `{row['weighted_mean_top_latent_fraction']:.4f}`, latent perplexity `{row['weighted_mean_latent_perplexity']:.4f}`, H(latent|action) `{row['latent_given_action_entropy']:.4f}`, NMI `{row['action_latent_nmi']:.4f}`"
+            )
+    else:
+        summary_lines.append("- No action-to-latent consistency analysis was run.")
     summary_lines.extend(
         [
             "",
@@ -1953,14 +2304,23 @@ def main() -> None:
             return None
         return float(rows.iloc[0][metric])
 
+    def action_to_latent_metric(action_target: str, latent_feature_set: str, metric: str) -> float | None:
+        rows = action_to_latent_summary_df[
+            (action_to_latent_summary_df["action_target"] == action_target)
+            & (action_to_latent_summary_df["latent_feature_set"] == latent_feature_set)
+        ]
+        if rows.shape[0] == 0:
+            return None
+        return float(rows.iloc[0][metric])
+
     analysis_manifest = {
         "artifact_type": "latent_analysis",
         "analysis_kind": "latent_core",
         "suite_name": "latent_core",
-        "suite_version": "v1",
+        "suite_version": "v2",
         "artifact_id": make_artifact_id(
             suite_name="latent_core",
-            suite_version="v1",
+            suite_version="v2",
             checkpoint_id=checkpoint_meta["source_checkpoint_id"],
             output_label=output_dir.name,
         ),
@@ -2005,6 +2365,24 @@ def main() -> None:
             "id_sequence_bucket_episode_nmi": context_metric("id_sequence", "bucket_episode_nmi"),
             "id_sequence_weighted_episode_coverage": context_metric(
                 "id_sequence", "weighted_mean_episode_coverage"
+            ),
+            "future_action_to_id_sequence_top_latent_fraction": action_to_latent_metric(
+                "future_action_mean", "id_sequence", "weighted_mean_top_latent_fraction"
+            ),
+            "future_action_to_id_sequence_latent_given_action_entropy": action_to_latent_metric(
+                "future_action_mean", "id_sequence", "latent_given_action_entropy"
+            ),
+            "future_action_to_id_sequence_nmi": action_to_latent_metric(
+                "future_action_mean", "id_sequence", "action_latent_nmi"
+            ),
+            "future_action_to_continuous_kmeans_top_latent_fraction": action_to_latent_metric(
+                "future_action_mean", "continuous_kmeans", "weighted_mean_top_latent_fraction"
+            ),
+            "future_action_to_continuous_kmeans_latent_given_action_entropy": action_to_latent_metric(
+                "future_action_mean", "continuous_kmeans", "latent_given_action_entropy"
+            ),
+            "future_action_to_continuous_kmeans_nmi": action_to_latent_metric(
+                "future_action_mean", "continuous_kmeans", "action_latent_nmi"
             ),
             "top_mi": None if action_mi_ranking_df is None or action_mi_ranking_df.shape[0] == 0 else float(action_mi_ranking_df.iloc[0]["mi"]),
             "top_nmi": None if action_mi_ranking_df is None or action_mi_ranking_df.shape[0] == 0 else float(action_mi_ranking_df.iloc[0]["nmi"]),
