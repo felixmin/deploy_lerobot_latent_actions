@@ -1,21 +1,19 @@
 #!/usr/bin/env python
 
-"""Create a LeRobot dataset copy whose latent labels are future action sequences.
+"""Create a LeRobot dataset copy whose latent labels are summed future action windows.
 
-This exporter writes one structured latent target per anchor row:
+This exporter writes one latent target per dataset row:
 
-    <feature_prefix>.<representation_name> : [horizon_frames, action_dim]
-    <feature_prefix>.valid                 : [horizon_frames]
+    <feature_prefix>.<representation_name> : [action_dim]
+    <feature_prefix>.valid                 : scalar
 
-The latent target keeps the full future action sequence. We do not collapse it to
-`mean`, `last`, `sum`, or any other aggregate. Normalization stats are pooled over
-all valid `(row, timestep)` pairs, so the saved stats have shape `[action_dim]` and
-broadcast across the latent horizon exactly like standard action normalization.
+`horizon_frames` controls the additive action window attached to each anchor row:
 
-`start_offset_frames` controls where the action window starts relative to the anchor row:
+- latent at anchor `t` is `sum(action[t:t+horizon_frames])`
+- if `t + horizon_frames` exceeds the episode length, the row is marked invalid
 
-- `start_offset_frames=0`: use actions at `[t, t+1, ..., t+horizon_frames-1]`
-- `start_offset_frames=1`: use actions at `[t+1, ..., t+horizon_frames]`
+The resulting dataset can then be queried dynamically with delta timestamps to
+assemble sparse latent plans such as `[0, 10, 20, 30, 40]` without relabeling.
 """
 
 import json
@@ -29,6 +27,7 @@ from pprint import pformat
 from typing import Any
 
 import numpy as np
+import torch
 
 from lerobot.configs import parser
 from lerobot.datasets.dataset_tools import add_features
@@ -56,11 +55,11 @@ class ActionAsLatentConfig:
     feature_prefix: str = "latent_labels"
     representation_name: str = "continuous_vector_latents"
     action_key: str = "action"
-    start_offset_frames: int = 0
     horizon_frames: int = 10
     label_dtype: str = "float32"
     invalid_fill_value: float = float("nan")
     batch_size: int = 4096
+    num_workers: int = 8
     force: bool = False
     max_valid_samples: int | None = None
 
@@ -70,7 +69,7 @@ class ActionAsLatentConfig:
         if self.output_dir is None:
             raise ValueError("Please specify `--output_dir`.")
         if self.output_repo_id is None:
-            suffix = f"action_as_latent_sequence_h{self.horizon_frames}"
+            suffix = f"action_as_latent_sum_h{self.horizon_frames}"
             self.output_repo_id = f"{self.dataset_repo_id}_{suffix}"
         if self.feature_prefix.startswith("observation."):
             raise ValueError(
@@ -81,13 +80,11 @@ class ActionAsLatentConfig:
             raise ValueError("representation_name must be non-empty.")
         if self.horizon_frames < 1:
             raise ValueError(f"horizon_frames must be >= 1, got {self.horizon_frames}.")
-        if self.start_offset_frames < 0:
-            raise ValueError(
-                f"start_offset_frames must be >= 0, got {self.start_offset_frames}."
-            )
         np.dtype(self.label_dtype)
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}.")
+        if self.num_workers < 0:
+            raise ValueError(f"num_workers must be >= 0, got {self.num_workers}.")
         if self.max_valid_samples is not None and self.max_valid_samples < 1:
             raise ValueError(f"max_valid_samples must be >= 1, got {self.max_valid_samples}.")
 
@@ -107,8 +104,8 @@ def _prepare_output_dir(output_dir: Path, force: bool) -> None:
 def _format_feature_values(values: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
     if len(shape) == 0:
         return values
-    if len(shape) == 1 and shape[0] == 1:
-        return values.reshape(-1, 1)
+    if len(shape) == 1:
+        return values
 
     formatted = np.empty((values.shape[0],), dtype=object)
     for idx in range(values.shape[0]):
@@ -116,8 +113,8 @@ def _format_feature_values(values: np.ndarray, shape: tuple[int, ...]) -> np.nda
     return formatted
 
 
-def _infer_valid_shape(*, horizon_frames: int) -> tuple[int, ...]:
-    return (int(horizon_frames),)
+def _infer_valid_shape() -> tuple[int, ...]:
+    return (1,)
 
 
 def _compute_float_feature_stats(
@@ -125,27 +122,29 @@ def _compute_float_feature_stats(
     label_array: np.ndarray,
     valid_supervision: np.ndarray,
 ) -> dict[str, np.ndarray]:
-    if label_array.ndim != 3:
+    if valid_supervision.ndim == 2 and int(valid_supervision.shape[1]) == 1:
+        valid_supervision = valid_supervision.reshape(valid_supervision.shape[0])
+    if label_array.ndim != 2:
         raise ValueError(
-            "Expected structured latent labels with shape [N, H, A], "
+            "Expected latent labels with shape [N, A], "
             f"got {tuple(label_array.shape)}"
         )
-    if valid_supervision.ndim != 2:
+    if valid_supervision.ndim != 1:
         raise ValueError(
-            "Expected structured latent validity with shape [N, H], "
+            "Expected latent validity with shape [N], "
             f"got {tuple(valid_supervision.shape)}"
         )
-    if label_array.shape[:2] != valid_supervision.shape:
+    if int(label_array.shape[0]) != int(valid_supervision.shape[0]):
         raise ValueError(
-            "Structured latent labels and validity mask must match on [N, H], "
+            "Latent labels and validity mask must match on [N], "
             f"got labels={tuple(label_array.shape)} valid={tuple(valid_supervision.shape)}"
         )
 
-    valid_steps = valid_supervision.astype(bool, copy=False)
-    if not valid_steps.any():
+    valid_rows = valid_supervision.astype(bool, copy=False)
+    if not valid_rows.any():
         return {}
 
-    values = label_array[valid_steps]
+    values = label_array[valid_rows]
     values64 = values.astype(np.float64, copy=False)
     stats = {
         "min": values.min(axis=0),
@@ -167,72 +166,51 @@ def _compute_float_feature_stats(
 
 def _action_delta_timestamps(
     *,
-    start_offset_frames: int,
     horizon_frames: int,
     fps: float,
 ) -> dict[str, list[float]]:
-    start = int(start_offset_frames)
-    stop = start + int(horizon_frames)
-    return {"action": [frame_idx / float(fps) for frame_idx in range(start, stop)]}
+    stop = int(horizon_frames)
+    return {"action": [frame_idx / float(fps) for frame_idx in range(stop)]}
 
 
 def _infer_output_shape(
     *,
-    horizon_frames: int,
     action_dim: int,
 ) -> tuple[int, ...]:
-    return (int(horizon_frames), int(action_dim))
+    return (int(action_dim),)
 
 
-def _load_tabular_action_columns(dataset: LeRobotDataset, action_key: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    hf_dataset = dataset.hf_dataset
-    actions = np.stack(hf_dataset[action_key]).astype(np.float32, copy=False)
-    row_indices = np.arange(actions.shape[0], dtype=np.int64)
-    episode_indices = np.asarray(hf_dataset["episode_index"], dtype=np.int64)
-    return row_indices, episode_indices, actions
-
-
-def _iter_episode_segments(episode_indices: np.ndarray):
-    if episode_indices.ndim != 1:
-        raise ValueError(f"Expected episode_indices rank 1, got {episode_indices.ndim}")
-    if episode_indices.size == 0:
-        return
-    boundaries = np.flatnonzero(np.diff(episode_indices) != 0) + 1
-    starts = np.concatenate(([0], boundaries))
-    ends = np.concatenate((boundaries, [episode_indices.shape[0]]))
-    for start, end in zip(starts, ends, strict=True):
-        yield int(episode_indices[start]), int(start), int(end)
-
-
-def _build_padded_action_windows(
+def _reduce_action_window_batch(
     *,
-    episode_actions: np.ndarray,
-    anchor_indices: np.ndarray,
-    start_offset_frames: int,
-    horizon_frames: int,
-    invalid_fill_value: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    batch_size = int(anchor_indices.shape[0])
-    action_dim = int(episode_actions.shape[1])
-    windows = np.full(
-        (batch_size, int(horizon_frames), action_dim),
-        invalid_fill_value,
-        dtype=episode_actions.dtype,
-    )
-    valid_steps = np.zeros((batch_size, int(horizon_frames)), dtype=np.int64)
-    episode_length = int(episode_actions.shape[0])
+    action_windows: torch.Tensor | np.ndarray,
+    action_is_pad: torch.Tensor | np.ndarray | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not torch.is_tensor(action_windows):
+        action_windows = torch.as_tensor(action_windows)
+    action_windows = action_windows.to(dtype=torch.float32)
 
-    for batch_idx, anchor in enumerate(anchor_indices.tolist()):
-        start = int(anchor) + int(start_offset_frames)
-        if start >= episode_length:
-            continue
-        stop = min(start + int(horizon_frames), episode_length)
-        step_count = max(stop - start, 0)
-        if step_count <= 0:
-            continue
-        windows[batch_idx, :step_count] = episode_actions[start:stop]
-        valid_steps[batch_idx, :step_count] = 1
-    return windows, valid_steps
+    if action_windows.ndim != 3:
+        raise ValueError(
+            "Expected action windows with shape [B, H, A], "
+            f"got {tuple(action_windows.shape)}"
+        )
+
+    batch_size = int(action_windows.shape[0])
+    if action_is_pad is None:
+        valid_rows = torch.ones(batch_size, dtype=torch.bool, device=action_windows.device)
+    else:
+        if not torch.is_tensor(action_is_pad):
+            action_is_pad = torch.as_tensor(action_is_pad)
+        action_is_pad = action_is_pad.to(device=action_windows.device, dtype=torch.bool)
+        if action_is_pad.ndim != 2 or tuple(action_is_pad.shape[:2]) != tuple(action_windows.shape[:2]):
+            raise ValueError(
+                "Expected action_is_pad with shape [B, H] matching action windows, "
+                f"got actions={tuple(action_windows.shape)} pads={tuple(action_is_pad.shape)}"
+            )
+        valid_rows = ~action_is_pad.any(dim=1)
+
+    targets = action_windows.sum(dim=1)
+    return targets, valid_rows
 
 
 def export_action_as_latent_dataset(cfg: ActionAsLatentConfig) -> None:
@@ -247,7 +225,7 @@ def export_action_as_latent_dataset(cfg: ActionAsLatentConfig) -> None:
     output_dir = cfg.output_dir.resolve()
     _prepare_output_dir(output_dir, cfg.force)
 
-    source_dataset = LeRobotDataset(cfg.dataset_repo_id, root=cfg.dataset_root, episodes=cfg.episodes)
+    source_dataset = LeRobotDataset(cfg.dataset_repo_id, root=cfg.dataset_root)
     action_feature = source_dataset.meta.features.get(cfg.action_key)
     if action_feature is None:
         raise KeyError(f"Dataset feature {cfg.action_key!r} is missing from source dataset metadata.")
@@ -259,17 +237,28 @@ def export_action_as_latent_dataset(cfg: ActionAsLatentConfig) -> None:
     action_dim = int(action_shape[0])
 
     delta_timestamps = _action_delta_timestamps(
-        start_offset_frames=int(cfg.start_offset_frames),
         horizon_frames=int(cfg.horizon_frames),
         fps=float(source_dataset.meta.fps),
     )
+    label_dataset = LeRobotDataset(
+        cfg.dataset_repo_id,
+        root=cfg.dataset_root,
+        episodes=cfg.episodes,
+        delta_timestamps=delta_timestamps,
+    )
+    dataloader = torch.utils.data.DataLoader(
+        label_dataset,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        shuffle=False,
+        pin_memory=False,
+        drop_last=False,
+        prefetch_factor=2 if cfg.num_workers > 0 else None,
+    )
     output_shape = _infer_output_shape(
-        horizon_frames=int(cfg.horizon_frames),
         action_dim=action_dim,
     )
-    valid_shape = _infer_valid_shape(
-        horizon_frames=int(cfg.horizon_frames),
-    )
+    valid_shape = _infer_valid_shape()
 
     total_frames = int(source_dataset.meta.total_frames)
     label_array = np.full(
@@ -290,88 +279,76 @@ def export_action_as_latent_dataset(cfg: ActionAsLatentConfig) -> None:
                 "feature_prefix": cfg.feature_prefix,
                 "representation_name": cfg.representation_name,
                 "action_key": cfg.action_key,
-                "start_offset_frames": cfg.start_offset_frames,
                 "horizon_frames": cfg.horizon_frames,
+                "batch_size": cfg.batch_size,
+                "num_workers": cfg.num_workers,
                 "output_shape": output_shape,
                 "valid_shape": valid_shape,
                 "delta_timestamps": delta_timestamps,
-                "implementation": "tabular_action_sequence",
+                "implementation": "streaming_action_window_sum",
             }
         ),
     )
 
     written = 0
-    processed_rows = 0
-    processed_batches = 0
     start_time = time.perf_counter()
-    row_indices, episode_indices, actions = _load_tabular_action_columns(source_dataset, cfg.action_key)
-    stop_export = False
+    with torch.inference_mode():
+        for batch_idx, batch in enumerate(dataloader, start=1):
+            row_idx = batch["index"]
+            if not torch.is_tensor(row_idx):
+                row_idx = torch.as_tensor(row_idx)
+            row_idx_np = row_idx.detach().cpu().numpy().astype(np.int64, copy=False)
 
-    for _episode_id, start, end in _iter_episode_segments(episode_indices):
-        episode_actions = actions[start:end]
-        episode_rows = row_indices[start:end]
-        episode_length = int(episode_actions.shape[0])
-        if episode_length <= int(cfg.start_offset_frames):
-            continue
-
-        for batch_start in range(0, episode_length, int(cfg.batch_size)):
-            batch_end = min(batch_start + int(cfg.batch_size), episode_length)
-            batch_rows = episode_rows[batch_start:batch_end]
-            local_anchor_indices = np.arange(batch_start, batch_end, dtype=np.int64)
-            windows, step_validity = _build_padded_action_windows(
-                episode_actions=episode_actions,
-                anchor_indices=local_anchor_indices,
-                start_offset_frames=int(cfg.start_offset_frames),
-                horizon_frames=int(cfg.horizon_frames),
-                invalid_fill_value=float(cfg.invalid_fill_value),
+            pad_key = f"{cfg.action_key}_is_pad"
+            action_windows = batch[cfg.action_key]
+            action_is_pad = batch.get(pad_key)
+            targets, row_validity = _reduce_action_window_batch(
+                action_windows=action_windows,
+                action_is_pad=action_is_pad,
             )
-            row_valid_mask = step_validity.any(axis=1).astype(bool, copy=False)
+            row_valid_mask = row_validity.detach().cpu().numpy().astype(bool, copy=False)
             row_valid_count = int(row_valid_mask.sum())
 
             if row_valid_count > 0:
-                valid_positions = np.flatnonzero(row_valid_mask)
+                valid_rows = row_idx_np[row_valid_mask]
                 if cfg.max_valid_samples is not None:
                     remaining = cfg.max_valid_samples - written
                     if remaining <= 0:
-                        stop_export = True
                         break
                     if row_valid_count > remaining:
-                        valid_positions = valid_positions[:remaining]
-                        row_valid_count = int(valid_positions.shape[0])
+                        valid_rows = valid_rows[:remaining]
+                        row_valid_count = remaining
 
-                valid_rows = batch_rows[valid_positions]
-                label_array[valid_rows] = windows[valid_positions].astype(
+                valid_targets = targets[row_validity]
+                if cfg.max_valid_samples is not None and valid_targets.shape[0] > row_valid_count:
+                    valid_targets = valid_targets[:row_valid_count]
+
+                label_array[valid_rows] = valid_targets.detach().cpu().numpy().astype(
                     np.dtype(cfg.label_dtype),
                     copy=False,
                 )
-                valid_supervision[valid_rows] = step_validity[valid_positions]
+                valid_supervision[valid_rows, 0] = 1
                 written += row_valid_count
 
-            processed_rows += int(batch_rows.shape[0])
-            processed_batches += 1
-
-            if processed_batches % PROGRESS_LOG_EVERY_BATCHES == 0 or processed_rows == total_frames:
+            if batch_idx % PROGRESS_LOG_EVERY_BATCHES == 0 or batch_idx == len(dataloader):
                 elapsed_s = max(time.perf_counter() - start_time, 1e-9)
+                processed_rows = min(batch_idx * cfg.batch_size, len(label_dataset))
                 rate = processed_rows / elapsed_s
                 logging.info(
                     "Progress: rows=%d/%d valid=%d rate=%.1f rows/s",
                     processed_rows,
-                    total_frames,
+                    len(label_dataset),
                     written,
                     rate,
                 )
 
             if cfg.max_valid_samples is not None and written >= cfg.max_valid_samples:
-                stop_export = True
                 break
-
-        if stop_export:
-            break
 
     logging.info(
         "Finalizing labeled dataset: output_dir=%s valid_rows=%d feature_name=%s.%s",
         output_dir,
-        int(valid_supervision.reshape(total_frames, -1).any(axis=1).sum()),
+        int(valid_supervision.sum()),
         cfg.feature_prefix,
         cfg.representation_name,
     )
@@ -402,7 +379,7 @@ def export_action_as_latent_dataset(cfg: ActionAsLatentConfig) -> None:
 
     checkpoint_meta = infer_checkpoint_metadata(None)
     label_manifest = {
-        "label_source_type": "dataset_action_sequence",
+        "label_source_type": "dataset_action_vector",
         "source_dataset_repo_id": cfg.dataset_repo_id,
         "source_dataset_root": cfg.dataset_root,
         "episodes": cfg.episodes,
@@ -415,14 +392,13 @@ def export_action_as_latent_dataset(cfg: ActionAsLatentConfig) -> None:
         "valid_feature_name": f"{cfg.feature_prefix}.valid",
         "stats_feature_names": [f"{cfg.feature_prefix}.{cfg.representation_name}"],
         "action_key": cfg.action_key,
-        "start_offset_frames": int(cfg.start_offset_frames),
         "horizon_frames": int(cfg.horizon_frames),
-        "label_layout": "sequence",
+        "label_layout": "vector_per_frame",
         "delta_timestamps": delta_timestamps,
         "valid_shape": valid_shape,
-        "num_valid_rows": int(valid_supervision.reshape(total_frames, -1).any(axis=1).sum()),
+        "num_valid_rows": int(valid_supervision.sum()),
         "num_valid_supervision_tokens": int(valid_supervision.sum()),
-        "num_valid_labels": int(valid_supervision.reshape(total_frames, -1).any(axis=1).sum()),
+        "num_valid_labels": int(valid_supervision.sum()),
     }
     label_manifest_path = output_dir / "label_manifest.json"
     label_manifest_path.write_text(json.dumps(label_manifest, indent=2) + "\n")
@@ -455,15 +431,14 @@ def export_action_as_latent_dataset(cfg: ActionAsLatentConfig) -> None:
         "valid_feature_name": f"{cfg.feature_prefix}.valid",
         "stats_feature_names": [f"{cfg.feature_prefix}.{cfg.representation_name}"],
         "action_key": cfg.action_key,
-        "start_offset_frames": int(cfg.start_offset_frames),
         "horizon_frames": int(cfg.horizon_frames),
-        "label_layout": "sequence",
+        "label_layout": "vector_per_frame",
         "delta_timestamps": delta_timestamps,
         "num_rows": int(source_dataset.meta.total_frames),
         "valid_shape": valid_shape,
-        "num_valid_rows": int(valid_supervision.reshape(total_frames, -1).any(axis=1).sum()),
+        "num_valid_rows": int(valid_supervision.sum()),
         "num_valid_supervision_tokens": int(valid_supervision.sum()),
-        "num_valid_labels": int(valid_supervision.reshape(total_frames, -1).any(axis=1).sum()),
+        "num_valid_labels": int(valid_supervision.sum()),
         "label_manifest_path": str(label_manifest_path),
     }
     register_artifact(
