@@ -45,6 +45,7 @@ class AnalysisLatentExportConfig:
     feature_prefix: str = "latent_labels"
     batch_size: int = 32
     num_workers: int = 8
+    rename_map: dict[str, str] | None = None
     force: bool = False
     max_valid_samples: int | None = None
 
@@ -292,7 +293,7 @@ def export_latent_analysis_dataset(cfg: AnalysisLatentExportConfig) -> None:
 
     source_dataset = LeRobotDataset(cfg.dataset_repo_id, root=cfg.dataset_root)
     source_info = copy.deepcopy(source_dataset.meta.info)
-    policy = make_policy(cfg.policy, ds_meta=source_dataset.meta)
+    policy = make_policy(cfg.policy, ds_meta=source_dataset.meta, rename_map=cfg.rename_map)
     prepare_latent_export = _get_required_method(policy, "prepare_latent_export")
     export_latent_labels = _get_required_method(policy, "export_latent_labels")
     plan = _normalize_export_plan(prepare_latent_export(source_dataset.meta))
@@ -334,6 +335,7 @@ def export_latent_analysis_dataset(cfg: AnalysisLatentExportConfig) -> None:
                 "passthrough_keys": passthrough_keys,
                 "batch_size": cfg.batch_size,
                 "num_workers": cfg.num_workers,
+                "rename_map": cfg.rename_map,
                 "delta_timestamps": plan["delta_timestamps"],
                 "max_valid_samples": cfg.max_valid_samples,
             }
