@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
+from scipy.spatial.transform import Rotation
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
@@ -37,6 +38,25 @@ def parse_hidden_dims(raw: str) -> tuple[int, ...]:
             "--probe-mlp-hidden-dims must be a comma-separated list of positive integers."
         )
     return dims
+
+
+def parse_future_target_config(raw: str) -> dict[str, Any]:
+    value = raw.strip()
+    if not value:
+        raise argparse.ArgumentTypeError("--future-target-config must not be empty.")
+
+    try:
+        candidate = Path(value)
+        if candidate.exists():
+            payload = json.loads(candidate.read_text())
+        else:
+            payload = json.loads(value)
+    except Exception as exc:
+        raise argparse.ArgumentTypeError(f"Failed to parse --future-target-config: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise argparse.ArgumentTypeError("--future-target-config must decode to a JSON object.")
+    return payload
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,6 +95,15 @@ def parse_args() -> argparse.Namespace:
         help="Future horizon used for derived action summaries such as future_action_mean.",
     )
     parser.add_argument(
+        "--future-target-config",
+        type=parse_future_target_config,
+        default=None,
+        help=(
+            "Optional JSON object or path to a JSON file describing how to aggregate the next "
+            "--future-frames actions into an additional future target."
+        ),
+    )
+    parser.add_argument(
         "--action-bins",
         type=int,
         default=16,
@@ -84,7 +113,7 @@ def parse_args() -> argparse.Namespace:
         "--probe-max-samples",
         type=int,
         default=100000,
-        help="Maximum number of valid rows to use in held-out action probes.",
+        help="Maximum number of valid rows to use in held-out action probes. Set to 0 to use all valid rows.",
     )
     parser.add_argument(
         "--probe-test-size",
@@ -313,14 +342,157 @@ def infer_episode_tail_counts(valid: np.ndarray, episode_index: np.ndarray) -> l
     return tails
 
 
+def default_future_target_config(action_dim: int) -> dict[str, Any]:
+    return {
+        "name": "future_action_mean",
+        "dims": [
+            {
+                "start": 0,
+                "end": action_dim,
+                "mode": "mean",
+            }
+        ],
+    }
+
+
+def validate_future_target_config(config: dict[str, Any], action_dim: int) -> dict[str, Any]:
+    if "name" not in config or not isinstance(config["name"], str) or not config["name"].strip():
+        raise ValueError("Future target config must define a non-empty string field `name`.")
+    if config["name"] == "current_action":
+        raise ValueError("Future target config name `current_action` is reserved.")
+    raw_dims = config.get("dims")
+    if not isinstance(raw_dims, list) or not raw_dims:
+        raise ValueError("Future target config must contain a non-empty `dims` list.")
+
+    normalized_dims = []
+    coverage = np.zeros(action_dim, dtype=np.int64)
+    allowed_modes = {"mean", "sum", "last", "compose_rotation"}
+    for idx, raw_dim in enumerate(raw_dims):
+        if not isinstance(raw_dim, dict):
+            raise ValueError(f"Future target config dims[{idx}] must be an object.")
+        if "start" not in raw_dim or "end" not in raw_dim or "mode" not in raw_dim:
+            raise ValueError(f"Future target config dims[{idx}] must define `start`, `end`, and `mode`.")
+        start = int(raw_dim["start"])
+        end = int(raw_dim["end"])
+        mode = str(raw_dim["mode"])
+        if mode not in allowed_modes:
+            raise ValueError(f"Unsupported future target mode {mode!r} in dims[{idx}].")
+        if start < 0 or end <= start or end > action_dim:
+            raise ValueError(
+                f"Future target config dims[{idx}] has invalid slice [{start}, {end}) for action_dim={action_dim}."
+            )
+        coverage[start:end] += 1
+        normalized = {"start": start, "end": end, "mode": mode}
+        if "scale" in raw_dim:
+            raw_scale = raw_dim["scale"]
+            if isinstance(raw_scale, (int, float)):
+                normalized["scale"] = float(raw_scale)
+            elif isinstance(raw_scale, list):
+                scale = [float(value) for value in raw_scale]
+                if len(scale) != end - start:
+                    raise ValueError(
+                        f"Future target config dims[{idx}] scale list length must match slice width {end - start}."
+                    )
+                normalized["scale"] = scale
+            else:
+                raise ValueError(f"Future target config dims[{idx}] scale must be a number or list of numbers.")
+        if mode == "compose_rotation":
+            representation = str(raw_dim.get("representation", ""))
+            if representation not in {"euler_delta", "rotvec_delta"}:
+                raise ValueError(
+                    "Future target mode `compose_rotation` supports "
+                    "`representation: \"euler_delta\"` or `representation: \"rotvec_delta\"`."
+                )
+            if end - start != 3:
+                raise ValueError("Future target mode `compose_rotation` requires a 3D slice.")
+            normalized["representation"] = representation
+        normalized_dims.append(normalized)
+
+    if not np.all(coverage == 1):
+        bad_dims = np.flatnonzero(coverage != 1).tolist()
+        raise ValueError(
+            "Future target config must cover each action dimension exactly once. "
+            f"Bad dims: {bad_dims}"
+        )
+
+    return {"name": config["name"].strip(), "dims": normalized_dims}
+
+
+def _compose_rotation_window(deltas: np.ndarray, representation: str) -> np.ndarray:
+    net = Rotation.identity()
+    for delta in deltas:
+        if representation == "euler_delta":
+            delta_rotation = Rotation.from_euler("xyz", delta, degrees=False)
+        elif representation == "rotvec_delta":
+            delta_rotation = Rotation.from_rotvec(delta)
+        else:
+            raise ValueError(f"Unsupported rotation representation: {representation!r}")
+        net = delta_rotation * net
+    if representation == "euler_delta":
+        return net.as_euler("xyz", degrees=False).astype(np.float32, copy=False)
+    return net.as_rotvec().astype(np.float32, copy=False)
+
+
+def _aggregate_future_window(
+    actions_ep: np.ndarray,
+    n_valid: int,
+    future_frames: int,
+    target_config: dict[str, Any],
+) -> np.ndarray:
+    action_dim = actions_ep.shape[1]
+    out = np.empty((n_valid, action_dim), dtype=np.float32)
+
+    for dim_spec in target_config["dims"]:
+        start = int(dim_spec["start"])
+        end = int(dim_spec["end"])
+        mode = str(dim_spec["mode"])
+        block = actions_ep[:, start:end].astype(np.float32, copy=False)
+        if "scale" in dim_spec:
+            block = block * np.asarray(dim_spec["scale"], dtype=np.float32)
+
+        if mode in {"mean", "sum"}:
+            cumsum = np.vstack([np.zeros((1, end - start), dtype=np.float32), np.cumsum(block, axis=0)])
+            future_sum = cumsum[1 + future_frames :] - cumsum[1:-future_frames]
+            future_sum = future_sum[:n_valid]
+            out[:, start:end] = (
+                future_sum / float(future_frames) if mode == "mean" else future_sum
+            ).astype(np.float32, copy=False)
+            continue
+
+        if mode == "last":
+            out[:, start:end] = block[future_frames : future_frames + n_valid].astype(np.float32, copy=False)
+            continue
+
+        if mode == "compose_rotation":
+            representation = str(dim_spec["representation"])
+            windows = np.empty((n_valid, end - start), dtype=np.float32)
+            for row in range(n_valid):
+                windows[row] = _compose_rotation_window(
+                    block[row + 1 : row + 1 + future_frames],
+                    representation,
+                )
+            out[:, start:end] = windows
+            continue
+
+        raise ValueError(f"Unsupported future target mode during aggregation: {mode!r}")
+
+    return out
+
+
 def derive_action_targets(
     actions: np.ndarray,
     valid: np.ndarray,
     episode_index: np.ndarray,
     future_frames: int,
+    future_target_config: dict[str, Any] | None = None,
 ) -> dict[str, np.ndarray]:
+    action_dim = int(actions.shape[1])
+    target_config = validate_future_target_config(
+        default_future_target_config(action_dim) if future_target_config is None else future_target_config,
+        action_dim=action_dim,
+    )
     current_chunks = []
-    future_mean_chunks = []
+    future_chunks = []
 
     for start, end in episode_ranges(episode_index):
         actions_ep = actions[start:end]
@@ -340,18 +512,21 @@ def derive_action_targets(
             )
 
         current_chunks.append(actions_ep[:n_valid])
-        cumsum = np.vstack([np.zeros((1, actions_ep.shape[1]), dtype=np.float32), np.cumsum(actions_ep, axis=0)])
-        future_sum = cumsum[1 + future_frames :] - cumsum[1:-future_frames]
-        future_mean = (future_sum / float(future_frames)).astype(np.float32, copy=False)
-        if future_mean.shape[0] < n_valid:
+        future_target = _aggregate_future_window(
+            actions_ep=actions_ep,
+            n_valid=n_valid,
+            future_frames=future_frames,
+            target_config=target_config,
+        )
+        if future_target.shape[0] < n_valid:
             raise ValueError(
                 f"Derived future action target is too short for episode with n_valid={n_valid} and future_frames={future_frames}."
             )
-        future_mean_chunks.append(future_mean[:n_valid])
+        future_chunks.append(future_target[:n_valid])
 
     return {
         "current_action": np.concatenate(current_chunks, axis=0),
-        "future_action_mean": np.concatenate(future_mean_chunks, axis=0),
+        str(target_config["name"]): np.concatenate(future_chunks, axis=0),
     }
 
 
@@ -1382,10 +1557,13 @@ def make_probe_split(
 ) -> tuple[np.ndarray, np.ndarray]:
     if valid_episode_index.shape[0] < 2:
         raise ValueError("Action probes require at least two valid rows.")
+    if max_samples < 0:
+        raise ValueError("--probe-max-samples must be >= 0.")
+    effective_max_samples = valid_episode_index.shape[0] if max_samples == 0 else max_samples
 
     rng = np.random.default_rng(seed)
     if mode == "row":
-        sample_size = min(max_samples, valid_episode_index.shape[0])
+        sample_size = min(effective_max_samples, valid_episode_index.shape[0])
         sampled_rows = rng.choice(valid_episode_index.shape[0], size=sample_size, replace=False)
         train_rows, test_rows = train_test_split(sampled_rows, test_size=test_size, random_state=seed, shuffle=True)
         return (
@@ -1396,7 +1574,7 @@ def make_probe_split(
     if mode != "episode":
         raise ValueError(f"Unsupported probe split mode: {mode!r}")
 
-    selected_rows = _select_episode_rows(valid_episode_index, max_samples=max_samples, rng=rng)
+    selected_rows = _select_episode_rows(valid_episode_index, max_samples=effective_max_samples, rng=rng)
     selected_eps = np.unique(valid_episode_index[selected_rows])
     if selected_eps.shape[0] < 2:
         raise ValueError("Episode-split action probes require at least two valid episodes after sampling.")
@@ -1749,7 +1927,17 @@ def main() -> None:
 
     all_actions, all_valid, episode_index, frame_index = load_action_context(dataset, action_col, valid_col)
     tail_counts = infer_episode_tail_counts(all_valid, episode_index)
-    action_targets = derive_action_targets(all_actions, all_valid, episode_index, args.future_frames)
+    action_targets = derive_action_targets(
+        all_actions,
+        all_valid,
+        episode_index,
+        args.future_frames,
+        future_target_config=args.future_target_config,
+    )
+    future_target_names = [name for name in action_targets if name != "current_action"]
+    if len(future_target_names) != 1:
+        raise ValueError(f"Expected exactly one future action target, got {future_target_names}.")
+    future_target_name = future_target_names[0]
     valid_episode_index = extract_valid_episode_index(all_valid, episode_index)
     valid_frame_index = extract_valid_scalar_context(frame_index, all_valid, episode_index).astype(np.int64, copy=False)
     valid_progress_index, valid_episode_lengths = extract_valid_progress_context(all_valid, episode_index)
@@ -2083,6 +2271,13 @@ def main() -> None:
         "dataset_root": str(dataset_root),
         "feature_prefix": args.feature_prefix,
         "future_frames": args.future_frames,
+        "future_target_name": future_target_name,
+        "future_target_config": validate_future_target_config(
+            default_future_target_config(int(all_actions.shape[1]))
+            if args.future_target_config is None
+            else args.future_target_config,
+            action_dim=int(all_actions.shape[1]),
+        ),
         "total_frames": int(sum(valid_counts.values())),
         "valid_counts": valid_counts,
         "valid_frames": valid_frames,
@@ -2177,6 +2372,7 @@ def main() -> None:
         f"- Dataset root: `{dataset_root}`",
         f"- Feature prefix: `{args.feature_prefix}`",
         f"- Future frames used for action summaries: `{args.future_frames}`",
+        f"- Future target name: `{future_target_name}`",
         f"- Total frames: `{summary['total_frames']}`",
         f"- Valid frames: `{summary['valid_frames']}`",
         f"- Invalid frames: `{summary['invalid_frames']}`",
@@ -2338,25 +2534,36 @@ def main() -> None:
         "headline_metrics": {
             "probe_split": args.probe_split,
             "probe_model": args.probe_model,
+            "future_target_name": future_target_name,
             "continuous_current_mean_r2": probe_metric("continuous", "current_action", "mean_r2"),
             "continuous_current_mean_mse": probe_metric("continuous", "current_action", "mean_mse"),
             "continuous_future_mean_r2": probe_metric("continuous", "future_action_mean", "mean_r2"),
             "continuous_future_mean_mse": probe_metric("continuous", "future_action_mean", "mean_mse"),
+            "continuous_future_target_mean_r2": probe_metric("continuous", future_target_name, "mean_r2"),
+            "continuous_future_target_mean_mse": probe_metric("continuous", future_target_name, "mean_mse"),
             "id_sequence_current_mean_r2": probe_metric("id_sequence", "current_action", "mean_r2"),
             "id_sequence_current_mean_mse": probe_metric("id_sequence", "current_action", "mean_mse"),
             "id_sequence_future_mean_r2": probe_metric("id_sequence", "future_action_mean", "mean_r2"),
             "id_sequence_future_mean_mse": probe_metric("id_sequence", "future_action_mean", "mean_mse"),
+            "id_sequence_future_target_mean_r2": probe_metric("id_sequence", future_target_name, "mean_r2"),
+            "id_sequence_future_target_mean_mse": probe_metric("id_sequence", future_target_name, "mean_mse"),
             "continuous_kmeans_current_mean_variance_explained": bucket_metric(
                 "continuous_kmeans", "current_action", "mean_variance_explained"
             ),
             "continuous_kmeans_future_mean_variance_explained": bucket_metric(
                 "continuous_kmeans", "future_action_mean", "mean_variance_explained"
             ),
+            "continuous_kmeans_future_target_mean_variance_explained": bucket_metric(
+                "continuous_kmeans", future_target_name, "mean_variance_explained"
+            ),
             "id_sequence_current_mean_variance_explained": bucket_metric(
                 "id_sequence", "current_action", "mean_variance_explained"
             ),
             "id_sequence_future_mean_variance_explained": bucket_metric(
                 "id_sequence", "future_action_mean", "mean_variance_explained"
+            ),
+            "id_sequence_future_target_mean_variance_explained": bucket_metric(
+                "id_sequence", future_target_name, "mean_variance_explained"
             ),
             "continuous_kmeans_bucket_episode_nmi": context_metric("continuous_kmeans", "bucket_episode_nmi"),
             "continuous_kmeans_weighted_episode_coverage": context_metric(
@@ -2383,6 +2590,24 @@ def main() -> None:
             ),
             "future_action_to_continuous_kmeans_nmi": action_to_latent_metric(
                 "future_action_mean", "continuous_kmeans", "action_latent_nmi"
+            ),
+            "future_target_to_id_sequence_top_latent_fraction": action_to_latent_metric(
+                future_target_name, "id_sequence", "weighted_mean_top_latent_fraction"
+            ),
+            "future_target_to_id_sequence_latent_given_action_entropy": action_to_latent_metric(
+                future_target_name, "id_sequence", "latent_given_action_entropy"
+            ),
+            "future_target_to_id_sequence_nmi": action_to_latent_metric(
+                future_target_name, "id_sequence", "action_latent_nmi"
+            ),
+            "future_target_to_continuous_kmeans_top_latent_fraction": action_to_latent_metric(
+                future_target_name, "continuous_kmeans", "weighted_mean_top_latent_fraction"
+            ),
+            "future_target_to_continuous_kmeans_latent_given_action_entropy": action_to_latent_metric(
+                future_target_name, "continuous_kmeans", "latent_given_action_entropy"
+            ),
+            "future_target_to_continuous_kmeans_nmi": action_to_latent_metric(
+                future_target_name, "continuous_kmeans", "action_latent_nmi"
             ),
             "top_mi": None if action_mi_ranking_df is None or action_mi_ranking_df.shape[0] == 0 else float(action_mi_ranking_df.iloc[0]["mi"]),
             "top_nmi": None if action_mi_ranking_df is None or action_mi_ranking_df.shape[0] == 0 else float(action_mi_ranking_df.iloc[0]["nmi"]),
