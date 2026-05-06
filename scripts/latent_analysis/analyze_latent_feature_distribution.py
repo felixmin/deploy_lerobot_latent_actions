@@ -1,37 +1,44 @@
 #!/usr/bin/env python
 
+"""Probe latent labels against real actions.
+
+This script intentionally keeps the latent analysis narrow: load an exported
+latent-label dataset, derive current and future action targets, then fit ridge
+and/or MLP probes on GPU with PyTorch.
+"""
+
+from __future__ import annotations
+
 import argparse
 import json
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
+import torch
 from scipy.spatial.transform import Rotation
-from sklearn.cluster import MiniBatchKMeans
-from sklearn.decomposition import PCA
-from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_squared_error, mutual_info_score, normalized_mutual_info_score, r2_score
 from sklearn.model_selection import train_test_split
-from sklearn.neural_network import MLPRegressor
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
 SCRIPTS_DIR = SCRIPT_DIR.parent
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+for path in (SCRIPT_DIR, SCRIPTS_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from _artifact_registry import infer_checkpoint_metadata, load_export_manifest, make_artifact_id, register_artifact
+
+
+@dataclass(frozen=True)
+class ProbeSplit:
+    train_rows: np.ndarray
+    test_rows: np.ndarray
+    val_rows: np.ndarray
 
 
 def parse_hidden_dims(raw: str) -> tuple[int, ...]:
@@ -43,34 +50,31 @@ def parse_hidden_dims(raw: str) -> tuple[int, ...]:
     return dims
 
 
+def parse_bool(raw: str) -> bool:
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
 def parse_future_target_config(raw: str) -> dict[str, Any]:
     value = raw.strip()
     if not value:
         raise argparse.ArgumentTypeError("--future-target-config must not be empty.")
-
     try:
         candidate = Path(value)
-        if candidate.exists():
-            payload = json.loads(candidate.read_text())
-        else:
-            payload = json.loads(value)
+        payload = json.loads(candidate.read_text() if candidate.exists() else value)
     except Exception as exc:
         raise argparse.ArgumentTypeError(f"Failed to parse --future-target-config: {exc}") from exc
-
     if not isinstance(payload, dict):
         raise argparse.ArgumentTypeError("--future-target-config must decode to a JSON object.")
     return payload
 
 
-def parse_probe_feature_sets(raw: str) -> set[str] | None:
+def parse_probe_feature_sets(raw: str) -> set[str]:
     values = {part.strip() for part in raw.split(",") if part.strip()}
     if not values:
         raise argparse.ArgumentTypeError("--probe-feature-sets must not be empty.")
-    if values == {"all"}:
-        return None
-    if "all" in values:
-        raise argparse.ArgumentTypeError("--probe-feature-sets cannot combine 'all' with explicit feature sets.")
     allowed = {"ids_onehot", "codebook_vectors", "continuous"}
+    if values == {"all"}:
+        return allowed
     unknown = values.difference(allowed)
     if unknown:
         raise argparse.ArgumentTypeError(f"Unknown --probe-feature-sets entries: {sorted(unknown)}")
@@ -78,161 +82,71 @@ def parse_probe_feature_sets(raw: str) -> set[str] | None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Analyze latent feature distributions for a labeled LeRobot dataset.")
+    parser = argparse.ArgumentParser(description="Run GPU ridge/MLP probes on latent-label exports.")
     parser.add_argument("--dataset-root", type=Path, required=True, help="Root of the labeled dataset.")
     parser.add_argument("--feature-prefix", type=str, required=True, help="Feature prefix, e.g. latent_labels.")
-    parser.add_argument("--output-dir", type=Path, required=True, help="Directory where plots and tables will be written.")
-    parser.add_argument(
-        "--top-k-sequences",
-        type=int,
-        default=50,
-        help="How many top codebook ID sequences to save and plot.",
-    )
-    parser.add_argument(
-        "--scatter-points",
-        type=int,
-        default=100000,
-        help="Maximum number of points to render in each PCA scatter plot.",
-    )
-    parser.add_argument(
-        "--pca-fit-points",
-        type=int,
-        default=50000,
-        help="Maximum number of rows used to fit each PCA projection.",
-    )
-    parser.add_argument(
-        "--rounded-decimals",
-        type=int,
-        default=3,
-        help="Decimal precision used for approximate uniqueness on float features.",
-    )
-    parser.add_argument(
-        "--future-frames",
-        type=int,
-        default=10,
-        help="Future horizon used for derived action summaries such as future_action_mean.",
-    )
+    parser.add_argument("--output-dir", type=Path, required=True, help="Directory where outputs are written.")
+    parser.add_argument("--future-frames", type=int, default=10, help="Future action horizon for target aggregation.")
     parser.add_argument(
         "--future-target-config",
         type=parse_future_target_config,
         default=None,
-        help=(
-            "Optional JSON object or path to a JSON file describing how to aggregate the next "
-            "--future-frames actions into an additional future target."
-        ),
-    )
-    parser.add_argument(
-        "--action-bins",
-        type=int,
-        default=16,
-        help="Quantile bins per action dimension for mutual information estimates.",
+        help="Optional JSON object or JSON file describing future action target aggregation.",
     )
     parser.add_argument(
         "--probe-max-samples",
         type=int,
-        default=100000,
-        help="Maximum number of valid rows to use in held-out action probes. Set to 0 to use all valid rows.",
+        default=0,
+        help="Maximum valid rows for probes. Set to 0 to use all valid rows.",
     )
-    parser.add_argument(
-        "--probe-test-size",
-        type=float,
-        default=0.2,
-        help="Held-out fraction for action probes.",
-    )
+    parser.add_argument("--probe-test-size", type=float, default=0.2, help="Held-out test fraction.")
+    parser.add_argument("--probe-val-size", type=float, default=0.1, help="Validation fraction from the train split.")
     parser.add_argument(
         "--probe-model",
         choices=("ridge", "mlp", "both"),
-        default="ridge",
-        help="Probe backend used for action prediction.",
+        default="both",
+        help="Probe backend to run.",
     )
     parser.add_argument(
         "--probe-feature-sets",
         type=parse_probe_feature_sets,
-        default=None,
-        help=(
-            "Comma-separated probe feature sets to evaluate. Supported values: "
-            "all, ids_onehot, codebook_vectors, continuous."
-        ),
+        default={"continuous"},
+        help="Comma-separated feature sets: continuous, codebook_vectors, ids_onehot, or all.",
     )
     parser.add_argument(
         "--probe-split",
         choices=("row", "episode"),
-        default="row",
-        help="How to split data into train/test for the action probes.",
+        default="episode",
+        help="Whether held-out rows are random rows or full episodes.",
     )
-    parser.add_argument(
-        "--ridge-alpha",
-        type=float,
-        default=1.0,
-        help="Ridge regularization used for linear action probes.",
-    )
-    parser.add_argument(
-        "--probe-mlp-hidden-dims",
-        type=parse_hidden_dims,
-        default=(512, 256),
-        help="Comma-separated hidden sizes for the MLP action probe.",
-    )
-    parser.add_argument(
-        "--probe-mlp-alpha",
-        type=float,
-        default=1e-4,
-        help="L2 regularization strength for the MLP action probe.",
-    )
+    parser.add_argument("--ridge-alpha", type=float, default=1.0, help="L2 regularization for ridge.")
+    parser.add_argument("--probe-mlp-hidden-dims", type=parse_hidden_dims, default=(512, 256))
+    parser.add_argument("--probe-mlp-alpha", type=float, default=1e-4, help="L2 regularization for MLP.")
     parser.add_argument(
         "--probe-mlp-max-iter",
         type=int,
         default=200,
-        help="Maximum optimization steps for the MLP action probe.",
+        help="Maximum MLP epochs. Kept for compatibility with the old sklearn argument name.",
     )
-    parser.add_argument(
-        "--probe-mlp-early-stopping",
-        type=lambda raw: raw.lower() in {"1", "true", "yes", "on"},
-        default=True,
-        help="Whether the MLP action probe should use validation-based early stopping.",
-    )
-    parser.add_argument(
-        "--probe-mlp-n-iter-no-change",
-        type=int,
-        default=10,
-        help="Patience used by the MLP action probe when early stopping is enabled.",
-    )
-    parser.add_argument(
-        "--bucket-kmeans-clusters",
-        type=int,
-        default=128,
-        help="Number of KMeans buckets used for continuous latents. Set to 0 to disable continuous bucketing.",
-    )
-    parser.add_argument(
-        "--bucket-kmeans-fit-samples",
-        type=int,
-        default=50000,
-        help="Maximum number of rows used to fit the continuous KMeans bucketing model.",
-    )
-    parser.add_argument(
-        "--bucket-top-k",
-        type=int,
-        default=20,
-        help="How many top buckets by count to keep in the JSON and README summaries.",
-    )
-    parser.add_argument(
-        "--bucket-progress-bins",
-        type=int,
-        default=10,
-        help="Number of normalized within-episode progress bins used for bucket context coverage.",
-    )
-    parser.add_argument(
-        "--action-bucket-kmeans-clusters",
-        type=int,
-        default=64,
-        help="Number of KMeans buckets used for reverse action-to-latent consistency analysis. Set to 0 to disable.",
-    )
-    parser.add_argument(
-        "--action-bucket-kmeans-fit-samples",
-        type=int,
-        default=50000,
-        help="Maximum number of rows used to fit the action-space KMeans model for reverse consistency analysis.",
-    )
-    parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    parser.add_argument("--probe-mlp-batch-size", type=int, default=8192)
+    parser.add_argument("--probe-mlp-lr", type=float, default=1e-3)
+    parser.add_argument("--probe-mlp-early-stopping", type=parse_bool, default=True)
+    parser.add_argument("--probe-mlp-n-iter-no-change", type=int, default=10)
+    parser.add_argument("--device", type=str, default="cuda", help="Torch device. Falls back to CPU if CUDA is unavailable.")
+    parser.add_argument("--seed", type=int, default=0)
+
+    # Legacy flags accepted as no-ops so older command templates do not fail.
+    parser.add_argument("--top-k-sequences", type=int, default=50, help=argparse.SUPPRESS)
+    parser.add_argument("--scatter-points", type=int, default=100000, help=argparse.SUPPRESS)
+    parser.add_argument("--pca-fit-points", type=int, default=50000, help=argparse.SUPPRESS)
+    parser.add_argument("--rounded-decimals", type=int, default=3, help=argparse.SUPPRESS)
+    parser.add_argument("--action-bins", type=int, default=16, help=argparse.SUPPRESS)
+    parser.add_argument("--bucket-kmeans-clusters", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--bucket-kmeans-fit-samples", type=int, default=50000, help=argparse.SUPPRESS)
+    parser.add_argument("--bucket-top-k", type=int, default=20, help=argparse.SUPPRESS)
+    parser.add_argument("--bucket-progress-bins", type=int, default=10, help=argparse.SUPPRESS)
+    parser.add_argument("--action-bucket-kmeans-clusters", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--action-bucket-kmeans-fit-samples", type=int, default=50000, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -241,8 +155,7 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def load_info(dataset_root: Path) -> dict[str, Any]:
-    info_path = dataset_root / "meta" / "info.json"
-    return json.loads(info_path.read_text())
+    return json.loads((dataset_root / "meta" / "info.json").read_text())
 
 
 def make_dataset(dataset_root: Path) -> ds.Dataset:
@@ -251,16 +164,12 @@ def make_dataset(dataset_root: Path) -> ds.Dataset:
 
 def load_valid_counts(dataset: ds.Dataset, valid_col: str) -> dict[str, int]:
     table = dataset.to_table(columns=[valid_col])
-    counts = {}
-    for item in pc.value_counts(table[valid_col]).to_pylist():
-        counts[str(item["values"])] = int(item["counts"])
-    return counts
+    return {str(item["values"]): int(item["counts"]) for item in pc.value_counts(table[valid_col]).to_pylist()}
 
 
 def load_ids(dataset: ds.Dataset, ids_col: str, valid_col: str) -> np.ndarray:
     table = dataset.to_table(columns=[ids_col], filter=ds.field(valid_col) == 1)
-    obj = table[ids_col].to_numpy(zero_copy_only=False)
-    ids = np.stack(obj).astype(np.int64, copy=False)
+    ids = np.stack(table[ids_col].to_numpy(zero_copy_only=False)).astype(np.int64, copy=False)
     return ensure_2d_rows(ids)
 
 
@@ -270,15 +179,12 @@ def load_float_array(dataset: ds.Dataset, column_name: str, valid_col: str) -> n
     return np.stack([np.stack(row, axis=0) for row in obj], axis=0).astype(np.float32, copy=False)
 
 
-def load_action_context(
-    dataset: ds.Dataset, action_col: str, valid_col: str
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    table = dataset.to_table(columns=[action_col, valid_col, "episode_index", "frame_index"])
+def load_action_context(dataset: ds.Dataset, action_col: str, valid_col: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    table = dataset.to_table(columns=[action_col, valid_col, "episode_index"])
     actions = np.stack(table[action_col].to_numpy(zero_copy_only=False)).astype(np.float32, copy=False)
     valid = table[valid_col].to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
     episode_index = table["episode_index"].to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
-    frame_index = table["frame_index"].to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
-    return actions, valid, episode_index, frame_index
+    return actions, valid, episode_index
 
 
 def ensure_2d_rows(arr: np.ndarray) -> np.ndarray:
@@ -290,68 +196,8 @@ def ensure_2d_rows(arr: np.ndarray) -> np.ndarray:
     return arr
 
 
-def ensure_slot_tensor(arr: np.ndarray) -> np.ndarray:
-    arr = np.asarray(arr)
-    if arr.ndim == 2:
-        return arr[:, None, :]
-    if arr.ndim != 3:
-        raise ValueError(f"Expected a 2D or 3D slot tensor, got shape={arr.shape}.")
-    return arr
-
-
-def contiguous_row_view(arr_2d: np.ndarray) -> np.ndarray:
-    arr_2d = ensure_2d_rows(arr_2d)
-    arr_2d = np.ascontiguousarray(arr_2d)
-    dtype = np.dtype((np.void, arr_2d.dtype.itemsize * arr_2d.shape[1]))
-    return arr_2d.view(dtype).reshape(-1)
-
-
-def unique_rows(arr_2d: np.ndarray) -> tuple[int, np.ndarray, np.ndarray]:
-    row_view = contiguous_row_view(arr_2d)
-    _, inverse, counts = np.unique(row_view, return_inverse=True, return_counts=True)
-    return int(counts.shape[0]), inverse, counts
-
-
-def summarize_numeric(values: np.ndarray) -> dict[str, float]:
-    flat = values.reshape(-1).astype(np.float64, copy=False)
-    return {
-        "mean": float(np.mean(flat)),
-        "std": float(np.std(flat)),
-        "min": float(np.min(flat)),
-        "p01": float(np.quantile(flat, 0.01)),
-        "p05": float(np.quantile(flat, 0.05)),
-        "median": float(np.median(flat)),
-        "p95": float(np.quantile(flat, 0.95)),
-        "p99": float(np.quantile(flat, 0.99)),
-        "max": float(np.max(flat)),
-    }
-
-
-def summarize_norms(values: np.ndarray) -> pd.DataFrame:
-    values = ensure_slot_tensor(values)
-    slot_norms = np.linalg.norm(values, axis=2)
-    rows = []
-    for slot_idx in range(slot_norms.shape[1]):
-        slot_values = slot_norms[:, slot_idx].astype(np.float64, copy=False)
-        rows.append(
-            {
-                "slot_index": slot_idx,
-                "mean": float(np.mean(slot_values)),
-                "std": float(np.std(slot_values)),
-                "min": float(np.min(slot_values)),
-                "p01": float(np.quantile(slot_values, 0.01)),
-                "p05": float(np.quantile(slot_values, 0.05)),
-                "median": float(np.median(slot_values)),
-                "p95": float(np.quantile(slot_values, 0.95)),
-                "p99": float(np.quantile(slot_values, 0.99)),
-                "max": float(np.max(slot_values)),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def format_sequence(seq: np.ndarray) -> str:
-    return " ".join(str(int(v)) for v in seq.tolist())
+def flatten_valid_latents(values: np.ndarray) -> np.ndarray:
+    return values.reshape(values.shape[0], -1).astype(np.float32, copy=False)
 
 
 def episode_ranges(episode_index: np.ndarray) -> list[tuple[int, int]]:
@@ -361,25 +207,24 @@ def episode_ranges(episode_index: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(starts.tolist(), ends.tolist(), strict=True))
 
 
-def infer_episode_tail_counts(valid: np.ndarray, episode_index: np.ndarray) -> list[int]:
-    tails = []
+def extract_valid_episode_index(valid: np.ndarray, episode_index: np.ndarray) -> np.ndarray:
+    chunks = []
     for start, end in episode_ranges(episode_index):
         valid_ep = valid[start:end]
-        tails.append(int(np.sum(valid_ep == 0)))
-    return tails
+        n_valid = int(np.sum(valid_ep == 1))
+        if not np.all(valid_ep[:n_valid] == 1) or not np.all(valid_ep[n_valid:] == 0):
+            raise ValueError("Expected valid rows to be contiguous at the start of each episode.")
+        if n_valid > 0:
+            chunks.append(episode_index[start : start + n_valid])
+    return np.concatenate(chunks, axis=0).astype(np.int64, copy=False) if chunks else np.empty((0,), dtype=np.int64)
+
+
+def infer_episode_tail_counts(valid: np.ndarray, episode_index: np.ndarray) -> list[int]:
+    return [int(np.sum(valid[start:end] == 0)) for start, end in episode_ranges(episode_index)]
 
 
 def default_future_target_config(action_dim: int) -> dict[str, Any]:
-    return {
-        "name": "future_action_mean",
-        "dims": [
-            {
-                "start": 0,
-                "end": action_dim,
-                "mode": "mean",
-            }
-        ],
-    }
+    return {"name": "future_action_mean", "dims": [{"start": 0, "end": action_dim, "mode": "mean"}]}
 
 
 def validate_future_target_config(config: dict[str, Any], action_dim: int) -> dict[str, Any]:
@@ -391,73 +236,48 @@ def validate_future_target_config(config: dict[str, Any], action_dim: int) -> di
     if not isinstance(raw_dims, list) or not raw_dims:
         raise ValueError("Future target config must contain a non-empty `dims` list.")
 
-    normalized_dims = []
     coverage = np.zeros(action_dim, dtype=np.int64)
-    allowed_modes = {"mean", "sum", "last", "compose_rotation"}
+    normalized_dims = []
     for idx, raw_dim in enumerate(raw_dims):
-        if not isinstance(raw_dim, dict):
-            raise ValueError(f"Future target config dims[{idx}] must be an object.")
-        if "start" not in raw_dim or "end" not in raw_dim or "mode" not in raw_dim:
-            raise ValueError(f"Future target config dims[{idx}] must define `start`, `end`, and `mode`.")
         start = int(raw_dim["start"])
         end = int(raw_dim["end"])
         mode = str(raw_dim["mode"])
-        if mode not in allowed_modes:
+        if mode not in {"mean", "sum", "last", "compose_rotation"}:
             raise ValueError(f"Unsupported future target mode {mode!r} in dims[{idx}].")
         if start < 0 or end <= start or end > action_dim:
-            raise ValueError(
-                f"Future target config dims[{idx}] has invalid slice [{start}, {end}) for action_dim={action_dim}."
-            )
+            raise ValueError(f"Invalid future target slice [{start}, {end}) for action_dim={action_dim}.")
         coverage[start:end] += 1
         normalized = {"start": start, "end": end, "mode": mode}
         if "scale" in raw_dim:
-            raw_scale = raw_dim["scale"]
-            if isinstance(raw_scale, (int, float)):
-                normalized["scale"] = float(raw_scale)
-            elif isinstance(raw_scale, list):
-                scale = [float(value) for value in raw_scale]
-                if len(scale) != end - start:
-                    raise ValueError(
-                        f"Future target config dims[{idx}] scale list length must match slice width {end - start}."
-                    )
-                normalized["scale"] = scale
-            else:
-                raise ValueError(f"Future target config dims[{idx}] scale must be a number or list of numbers.")
+            normalized["scale"] = raw_dim["scale"]
         if mode == "compose_rotation":
             representation = str(raw_dim.get("representation", ""))
             if representation not in {"euler_delta", "rotvec_delta"}:
-                raise ValueError(
-                    "Future target mode `compose_rotation` supports "
-                    "`representation: \"euler_delta\"` or `representation: \"rotvec_delta\"`."
-                )
+                raise ValueError("compose_rotation requires representation euler_delta or rotvec_delta.")
             if end - start != 3:
-                raise ValueError("Future target mode `compose_rotation` requires a 3D slice.")
+                raise ValueError("compose_rotation requires a 3D slice.")
             normalized["representation"] = representation
         normalized_dims.append(normalized)
 
     if not np.all(coverage == 1):
-        bad_dims = np.flatnonzero(coverage != 1).tolist()
-        raise ValueError(
-            "Future target config must cover each action dimension exactly once. "
-            f"Bad dims: {bad_dims}"
-        )
-
+        raise ValueError("Future target config must cover each action dimension exactly once.")
     return {"name": config["name"].strip(), "dims": normalized_dims}
 
 
 def _compose_rotation_window(deltas: np.ndarray, representation: str) -> np.ndarray:
     net = Rotation.identity()
     for delta in deltas:
-        if representation == "euler_delta":
-            delta_rotation = Rotation.from_euler("xyz", delta, degrees=False)
-        elif representation == "rotvec_delta":
-            delta_rotation = Rotation.from_rotvec(delta)
-        else:
-            raise ValueError(f"Unsupported rotation representation: {representation!r}")
+        delta_rotation = (
+            Rotation.from_euler("xyz", delta, degrees=False)
+            if representation == "euler_delta"
+            else Rotation.from_rotvec(delta)
+        )
         net = delta_rotation * net
-    if representation == "euler_delta":
-        return net.as_euler("xyz", degrees=False).astype(np.float32, copy=False)
-    return net.as_rotvec().astype(np.float32, copy=False)
+    return (
+        net.as_euler("xyz", degrees=False).astype(np.float32, copy=False)
+        if representation == "euler_delta"
+        else net.as_rotvec().astype(np.float32, copy=False)
+    )
 
 
 def _aggregate_future_window(
@@ -468,7 +288,6 @@ def _aggregate_future_window(
 ) -> np.ndarray:
     action_dim = actions_ep.shape[1]
     out = np.empty((n_valid, action_dim), dtype=np.float32)
-
     for dim_spec in target_config["dims"]:
         start = int(dim_spec["start"])
         end = int(dim_spec["end"])
@@ -481,28 +300,19 @@ def _aggregate_future_window(
             cumsum = np.vstack([np.zeros((1, end - start), dtype=np.float32), np.cumsum(block, axis=0)])
             future_sum = cumsum[1 + future_frames :] - cumsum[1:-future_frames]
             future_sum = future_sum[:n_valid]
-            out[:, start:end] = (
-                future_sum / float(future_frames) if mode == "mean" else future_sum
-            ).astype(np.float32, copy=False)
-            continue
-
-        if mode == "last":
-            out[:, start:end] = block[future_frames : future_frames + n_valid].astype(np.float32, copy=False)
-            continue
-
-        if mode == "compose_rotation":
-            representation = str(dim_spec["representation"])
+            out[:, start:end] = future_sum / float(future_frames) if mode == "mean" else future_sum
+        elif mode == "last":
+            out[:, start:end] = block[future_frames : future_frames + n_valid]
+        elif mode == "compose_rotation":
             windows = np.empty((n_valid, end - start), dtype=np.float32)
             for row in range(n_valid):
                 windows[row] = _compose_rotation_window(
                     block[row + 1 : row + 1 + future_frames],
-                    representation,
+                    str(dim_spec["representation"]),
                 )
             out[:, start:end] = windows
-            continue
-
-        raise ValueError(f"Unsupported future target mode during aggregation: {mode!r}")
-
+        else:
+            raise ValueError(f"Unsupported future target mode during aggregation: {mode!r}")
     return out
 
 
@@ -511,8 +321,10 @@ def derive_action_targets(
     valid: np.ndarray,
     episode_index: np.ndarray,
     future_frames: int,
-    future_target_config: dict[str, Any] | None = None,
+    future_target_config: dict[str, Any] | None,
 ) -> dict[str, np.ndarray]:
+    if future_frames <= 0:
+        raise ValueError("--future-frames must be positive.")
     action_dim = int(actions.shape[1])
     target_config = validate_future_target_config(
         default_future_target_config(action_dim) if future_target_config is None else future_target_config,
@@ -520,1403 +332,464 @@ def derive_action_targets(
     )
     current_chunks = []
     future_chunks = []
-
     for start, end in episode_ranges(episode_index):
         actions_ep = actions[start:end]
         valid_ep = valid[start:end]
         n_valid = int(np.sum(valid_ep == 1))
-        if not np.all(valid_ep[:n_valid] == 1):
+        if not np.all(valid_ep[:n_valid] == 1) or not np.all(valid_ep[n_valid:] == 0):
             raise ValueError("Expected valid rows to be contiguous at the start of each episode.")
-        if not np.all(valid_ep[n_valid:] == 0):
-            raise ValueError("Expected invalid rows to be contiguous at the end of each episode.")
         if n_valid == 0:
             continue
-        if future_frames <= 0:
-            raise ValueError("--future-frames must be positive.")
         if actions_ep.shape[0] < n_valid + future_frames:
             raise ValueError(
-                f"Episode has length {actions_ep.shape[0]}, which is too short for n_valid={n_valid} and future_frames={future_frames}."
+                f"Episode length {actions_ep.shape[0]} is too short for n_valid={n_valid} and future_frames={future_frames}."
             )
-
         current_chunks.append(actions_ep[:n_valid])
-        future_target = _aggregate_future_window(
-            actions_ep=actions_ep,
-            n_valid=n_valid,
-            future_frames=future_frames,
-            target_config=target_config,
+        future_chunks.append(
+            _aggregate_future_window(actions_ep, n_valid, future_frames, target_config)[:n_valid]
         )
-        if future_target.shape[0] < n_valid:
-            raise ValueError(
-                f"Derived future action target is too short for episode with n_valid={n_valid} and future_frames={future_frames}."
-            )
-        future_chunks.append(future_target[:n_valid])
-
     return {
         "current_action": np.concatenate(current_chunks, axis=0),
         str(target_config["name"]): np.concatenate(future_chunks, axis=0),
     }
 
 
-def extract_valid_episode_index(valid: np.ndarray, episode_index: np.ndarray) -> np.ndarray:
-    chunks = []
-    for start, end in episode_ranges(episode_index):
-        valid_ep = valid[start:end]
-        n_valid = int(np.sum(valid_ep == 1))
-        if not np.all(valid_ep[:n_valid] == 1):
-            raise ValueError("Expected valid rows to be contiguous at the start of each episode.")
-        if not np.all(valid_ep[n_valid:] == 0):
-            raise ValueError("Expected invalid rows to be contiguous at the end of each episode.")
-        if n_valid == 0:
-            continue
-        chunks.append(episode_index[start : start + n_valid])
-    if not chunks:
-        return np.empty((0,), dtype=np.int64)
-    return np.concatenate(chunks, axis=0).astype(np.int64, copy=False)
-
-
-def extract_valid_scalar_context(values: np.ndarray, valid: np.ndarray, episode_index: np.ndarray) -> np.ndarray:
-    chunks = []
-    for start, end in episode_ranges(episode_index):
-        valid_ep = valid[start:end]
-        n_valid = int(np.sum(valid_ep == 1))
-        if not np.all(valid_ep[:n_valid] == 1):
-            raise ValueError("Expected valid rows to be contiguous at the start of each episode.")
-        if not np.all(valid_ep[n_valid:] == 0):
-            raise ValueError("Expected invalid rows to be contiguous at the end of each episode.")
-        if n_valid == 0:
-            continue
-        chunks.append(values[start : start + n_valid])
-    if not chunks:
-        return np.empty((0,), dtype=values.dtype)
-    return np.concatenate(chunks, axis=0)
-
-
-def extract_valid_progress_context(valid: np.ndarray, episode_index: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    progress_idx_chunks = []
-    episode_len_chunks = []
-    for start, end in episode_ranges(episode_index):
-        valid_ep = valid[start:end]
-        n_valid = int(np.sum(valid_ep == 1))
-        if not np.all(valid_ep[:n_valid] == 1):
-            raise ValueError("Expected valid rows to be contiguous at the start of each episode.")
-        if not np.all(valid_ep[n_valid:] == 0):
-            raise ValueError("Expected invalid rows to be contiguous at the end of each episode.")
-        if n_valid == 0:
-            continue
-        progress_idx_chunks.append(np.arange(n_valid, dtype=np.int64))
-        episode_len_chunks.append(np.full(n_valid, n_valid, dtype=np.int64))
-    if not progress_idx_chunks:
-        return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
-    return (
-        np.concatenate(progress_idx_chunks, axis=0).astype(np.int64, copy=False),
-        np.concatenate(episode_len_chunks, axis=0).astype(np.int64, copy=False),
-    )
-
-
-def quantile_bin_1d(values: np.ndarray, n_bins: int) -> tuple[np.ndarray, np.ndarray]:
-    edges = np.quantile(values, np.linspace(0.0, 1.0, n_bins + 1))
-    edges = np.unique(edges)
-    if edges.shape[0] <= 2:
-        return np.zeros(values.shape[0], dtype=np.int64), edges
-    binned = np.digitize(values, edges[1:-1], right=False).astype(np.int64, copy=False)
-    return binned, edges
-
-
-def quantile_bin_targets(targets: dict[str, np.ndarray], n_bins: int) -> tuple[dict[str, np.ndarray], dict[str, list[int]]]:
-    binned_targets = {}
-    bin_counts = {}
-    for target_name, values in targets.items():
-        binned = np.zeros(values.shape, dtype=np.int64)
-        counts = []
-        for dim in range(values.shape[1]):
-            binned[:, dim], edges = quantile_bin_1d(values[:, dim], n_bins)
-            counts.append(int(max(len(edges) - 1, 1)))
-        binned_targets[target_name] = binned
-        bin_counts[target_name] = counts
-    return binned_targets, bin_counts
-
-
-def make_one_hot_encoder() -> OneHotEncoder:
-    try:
-        return OneHotEncoder(handle_unknown="ignore", sparse_output=True)
-    except TypeError:
-        return OneHotEncoder(handle_unknown="ignore", sparse=True)
-
-
-def plot_valid_distribution(valid_counts: dict[str, int], output_path: Path) -> None:
-    labels = sorted(valid_counts.keys(), key=int)
-    values = [valid_counts[label] for label in labels]
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.bar(labels, values, color=["#4c78a8", "#f58518"][: len(labels)])
-    ax.set_title("Valid Flag Distribution")
-    ax.set_xlabel("valid")
-    ax.set_ylabel("frames")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-
-
-def plot_top_sequences(df: pd.DataFrame, output_path: Path) -> None:
-    top = df.head(20).iloc[::-1]
-    fig_height = max(5, 0.35 * len(top))
-    fig, ax = plt.subplots(figsize=(10, fig_height))
-    ax.barh(top["sequence"], top["count"], color="#4c78a8")
-    ax.set_title("Top Codebook ID Sequences")
-    ax.set_xlabel("count")
-    ax.set_ylabel("sequence")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=220)
-    plt.close(fig)
-
-
-def plot_id_position_counts(ids: np.ndarray, output_path: Path) -> pd.DataFrame:
-    rows = []
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    for pos in range(ids.shape[1]):
-        ax = axes.flat[pos]
-        values, counts = np.unique(ids[:, pos], return_counts=True)
-        order = np.argsort(counts)[::-1]
-        values = values[order]
-        counts = counts[order]
-        for value, count in zip(values.tolist(), counts.tolist(), strict=True):
-            rows.append({"position": pos, "token_id": int(value), "count": int(count)})
-
-        display_k = min(20, len(values))
-        ax.bar([str(int(v)) for v in values[:display_k]], counts[:display_k], color="#f58518")
-        ax.set_title(f"Position {pos} Top IDs")
-        ax.set_xlabel("token id")
-        ax.set_ylabel("count")
-        ax.tick_params(axis="x", rotation=45)
-
-    fig.suptitle("Codebook ID Usage by Position", fontsize=14)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=220)
-    plt.close(fig)
-    return pd.DataFrame(rows)
-
-
-def plot_value_histogram(values: np.ndarray, title: str, output_path: Path) -> None:
-    flat = values.reshape(-1).astype(np.float64, copy=False)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.hist(flat, bins=120, color="#4c78a8", alpha=0.9)
-    ax.set_title(title)
-    ax.set_xlabel("value")
-    ax.set_ylabel("count")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=220)
-    plt.close(fig)
-
-
-def plot_slot_norms(values: np.ndarray, title: str, output_path: Path) -> None:
-    values = ensure_slot_tensor(values)
-    norms = np.linalg.norm(values, axis=2)
-    fig, ax = plt.subplots(figsize=(9, 5))
-    for slot_idx in range(norms.shape[1]):
-        ax.hist(norms[:, slot_idx], bins=100, alpha=0.45, label=f"slot {slot_idx}")
-    ax.set_title(title)
-    ax.set_xlabel("L2 norm")
-    ax.set_ylabel("count")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=220)
-    plt.close(fig)
-
-
-def plot_heatmap(
-    matrix: np.ndarray,
-    row_labels: list[str],
-    col_labels: list[str],
-    title: str,
-    colorbar_label: str,
-    output_path: Path,
-) -> None:
-    fig_width = max(7, 1.1 * len(col_labels))
-    fig_height = max(5, 0.5 * len(row_labels))
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-    image = ax.imshow(matrix, aspect="auto", cmap="viridis")
-    ax.set_xticks(np.arange(len(col_labels)))
-    ax.set_xticklabels(col_labels, rotation=45, ha="right")
-    ax.set_yticks(np.arange(len(row_labels)))
-    ax.set_yticklabels(row_labels)
-    ax.set_title(title)
-    colorbar = fig.colorbar(image, ax=ax)
-    colorbar.set_label(colorbar_label)
-    for row in range(matrix.shape[0]):
-        for col in range(matrix.shape[1]):
-            ax.text(col, row, f"{matrix[row, col]:.3f}", ha="center", va="center", color="white", fontsize=8)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=220)
-    plt.close(fig)
-
-
-def make_pca_scatter(
-    flat_values: np.ndarray,
-    usage_counts: np.ndarray,
-    title: str,
-    output_path: Path,
-    csv_path: Path,
-    rng: np.random.Generator,
-    fit_points: int,
-    scatter_points: int,
-    colorbar_label: str = "log10(ID sequence usage)",
-) -> None:
-    n_rows = flat_values.shape[0]
-    fit_idx = rng.choice(n_rows, size=min(fit_points, n_rows), replace=False)
-    plot_idx = rng.choice(n_rows, size=min(scatter_points, n_rows), replace=False)
-
-    pca = PCA(n_components=2, svd_solver="randomized", random_state=0)
-    pca.fit(flat_values[fit_idx])
-    coords = pca.transform(flat_values[plot_idx])
-    plot_usage = usage_counts[plot_idx]
-    log_usage = np.log10(plot_usage.astype(np.float64))
-
-    sample_df = pd.DataFrame(
-        {
-            "x": coords[:, 0],
-            "y": coords[:, 1],
-            "usage_count": plot_usage,
-            "log10_usage_count": log_usage,
-        }
-    )
-    sample_df.to_csv(csv_path, index=False)
-
-    fig, ax = plt.subplots(figsize=(9, 7))
-    scatter = ax.scatter(
-        coords[:, 0],
-        coords[:, 1],
-        c=log_usage,
-        s=7,
-        cmap="viridis",
-        alpha=0.7,
-        linewidths=0,
-    )
-    ax.set_title(title)
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
-    colorbar = fig.colorbar(scatter, ax=ax)
-    colorbar.set_label(colorbar_label)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=220)
-    plt.close(fig)
-
-
-def compute_action_mutual_information(
-    ids: np.ndarray,
-    id_sequence_labels: np.ndarray,
-    binned_targets: dict[str, np.ndarray],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    rows = []
-    feature_map = {"id_sequence": id_sequence_labels}
-    for pos in range(ids.shape[1]):
-        feature_map[f"id_pos{pos}"] = ids[:, pos]
-
-    for target_name, target_values in binned_targets.items():
-        for action_dim in range(target_values.shape[1]):
-            target = target_values[:, action_dim]
-            for feature_name, feature_values in feature_map.items():
-                rows.append(
-                    {
-                        "target": target_name,
-                        "action_dim": action_dim,
-                        "feature": feature_name,
-                        "mi": float(mutual_info_score(feature_values, target)),
-                        "nmi": float(normalized_mutual_info_score(feature_values, target)),
-                    }
-                )
-    df = pd.DataFrame(rows)
-    ranking = df.sort_values(["mi", "nmi"], ascending=[False, False]).reset_index(drop=True)
-    return df, ranking
-
-
-def group_rows_by_bucket(bucket_index: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    if bucket_index.ndim != 1:
-        raise ValueError(f"Expected 1D bucket index array, got shape={bucket_index.shape}.")
-    if bucket_index.shape[0] == 0:
-        return (
-            np.empty((0,), dtype=np.int64),
-            np.empty((0,), dtype=np.int64),
-            np.empty((0,), dtype=np.int64),
-            np.empty((0,), dtype=np.int64),
-        )
-
-    order = np.argsort(bucket_index, kind="stable")
-    sorted_bucket_index = bucket_index[order]
-    split_points = np.flatnonzero(np.diff(sorted_bucket_index)) + 1
-    starts = np.concatenate(([0], split_points)).astype(np.int64, copy=False)
-    ends = np.concatenate((split_points, [sorted_bucket_index.shape[0]])).astype(np.int64, copy=False)
-    bucket_ids = sorted_bucket_index[starts].astype(np.int64, copy=False)
-    return order.astype(np.int64, copy=False), bucket_ids, starts, ends
-
-
-def compute_bucket_action_statistics(
-    *,
-    bucket_index: np.ndarray,
-    bucket_names: np.ndarray,
-    target_values: np.ndarray,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    if bucket_index.shape[0] != target_values.shape[0]:
-        raise ValueError("Bucket indices and action targets must have the same number of rows.")
-    if bucket_names.ndim != 1:
-        raise ValueError(f"Expected 1D bucket names array, got shape={bucket_names.shape}.")
-
-    total_rows = int(bucket_index.shape[0])
-    counts = np.bincount(bucket_index, minlength=int(bucket_names.shape[0]))
-    order, active_bucket_ids, starts, ends = group_rows_by_bucket(bucket_index)
-    sorted_targets = target_values[order].astype(np.float64, copy=False)
-    global_var = np.var(target_values.astype(np.float64, copy=False), axis=0)
-    within_var_numer = np.zeros(target_values.shape[1], dtype=np.float64)
-    weighted_std_sum = np.zeros(target_values.shape[1], dtype=np.float64)
-
-    rows: list[dict[str, Any]] = []
-    for bucket_id, start, end in zip(active_bucket_ids.tolist(), starts.tolist(), ends.tolist(), strict=True):
-        bucket_target = sorted_targets[start:end]
-        count = int(end - start)
-        fraction = float(count / total_rows)
-        mean = np.mean(bucket_target, axis=0)
-        std = np.std(bucket_target, axis=0)
-        var = np.var(bucket_target, axis=0)
-        within_var_numer += var * count
-        weighted_std_sum += std * count
-
-        row: dict[str, Any] = {
-            "bucket_id": int(bucket_id),
-            "bucket_label": str(bucket_names[bucket_id]),
-            "count": count,
-            "fraction": fraction,
-        }
-        for action_dim, value in enumerate(mean.tolist()):
-            row[f"mean_a{action_dim}"] = float(value)
-        for action_dim, value in enumerate(std.tolist()):
-            row[f"std_a{action_dim}"] = float(value)
-        rows.append(row)
-
-    stats_df = pd.DataFrame(rows).sort_values(["count", "bucket_id"], ascending=[False, True], ignore_index=True)
-    within_var = within_var_numer / float(max(total_rows, 1))
-    variance_explained = np.where(global_var > 1e-12, 1.0 - (within_var / global_var), 0.0)
-    weighted_mean_std = weighted_std_sum / float(max(total_rows, 1))
-
-    summary = {
-        "total_rows": total_rows,
-        "total_buckets": int(bucket_names.shape[0]),
-        "active_buckets": int(active_bucket_ids.shape[0]),
-        "singleton_buckets": int(np.sum(counts == 1)),
-        "max_bucket_usage": int(np.max(counts)) if counts.shape[0] > 0 else 0,
-        "max_bucket_fraction": float(np.max(counts) / total_rows) if total_rows > 0 and counts.shape[0] > 0 else 0.0,
-        "mean_variance_explained": float(np.mean(variance_explained)),
-        "variance_explained_by_dim": [float(value) for value in variance_explained.tolist()],
-        "mean_within_bucket_std": float(np.mean(weighted_mean_std)),
-        "within_bucket_std_by_dim": [float(value) for value in weighted_mean_std.tolist()],
-    }
-    return stats_df, summary
-
-
-def _normalized_progress_bins(
-    progress_index: np.ndarray,
-    episode_lengths: np.ndarray,
-    n_bins: int,
-) -> np.ndarray:
-    if progress_index.shape != episode_lengths.shape:
-        raise ValueError("Progress indices and episode lengths must have the same shape.")
-    if n_bins < 1:
-        raise ValueError("Progress bins must be >= 1.")
-    if progress_index.shape[0] == 0:
-        return np.empty((0,), dtype=np.int64)
-    denom = np.maximum(episode_lengths.astype(np.float64, copy=False) - 1.0, 1.0)
-    normalized = progress_index.astype(np.float64, copy=False) / denom
-    bins = np.floor(normalized * float(n_bins)).astype(np.int64, copy=False)
-    return np.clip(bins, 0, n_bins - 1)
-
-
-def compute_bucket_context_statistics(
-    *,
-    bucket_index: np.ndarray,
-    bucket_names: np.ndarray,
-    valid_episode_index: np.ndarray,
-    valid_frame_index: np.ndarray,
-    valid_progress_index: np.ndarray,
-    valid_episode_lengths: np.ndarray,
-    progress_bins: int,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    if bucket_index.shape[0] != valid_episode_index.shape[0]:
-        raise ValueError("Bucket indices and episode indices must have the same number of rows.")
-    if valid_frame_index.shape[0] != bucket_index.shape[0]:
-        raise ValueError("Bucket indices and frame indices must have the same number of rows.")
-    if valid_progress_index.shape[0] != bucket_index.shape[0]:
-        raise ValueError("Bucket indices and progress indices must have the same number of rows.")
-    if valid_episode_lengths.shape[0] != bucket_index.shape[0]:
-        raise ValueError("Bucket indices and episode lengths must have the same number of rows.")
-    if bucket_names.ndim != 1:
-        raise ValueError(f"Expected 1D bucket names array, got shape={bucket_names.shape}.")
-
-    total_rows = int(bucket_index.shape[0])
-    if total_rows == 0:
-        empty_df = pd.DataFrame(
-            columns=[
-                "bucket_id",
-                "bucket_label",
-                "count",
-                "fraction",
-                "unique_episodes",
-                "episode_coverage",
-                "max_episode_fraction",
-                "episode_perplexity",
-                "mean_run_length",
-                "max_run_length",
-                "adjacent_repeat_fraction",
-                "progress_bin_coverage",
-            ]
-        )
-        return empty_df, {
-            "total_rows": 0,
-            "total_buckets": int(bucket_names.shape[0]),
-            "active_buckets": 0,
-            "weighted_mean_episode_coverage": 0.0,
-            "weighted_mean_max_episode_fraction": 0.0,
-            "weighted_mean_episode_perplexity": 0.0,
-            "weighted_mean_run_length": 0.0,
-            "weighted_max_run_length": 0.0,
-            "weighted_adjacent_repeat_fraction": 0.0,
-            "weighted_progress_bin_coverage": 0.0,
-            "bucket_episode_nmi": 0.0,
-        }
-
-    total_episodes = int(np.unique(valid_episode_index).shape[0])
-    progress_bin_index = _normalized_progress_bins(valid_progress_index, valid_episode_lengths, n_bins=progress_bins)
-    counts = np.bincount(bucket_index, minlength=int(bucket_names.shape[0]))
-    bucket_episode_nmi = float(normalized_mutual_info_score(bucket_index, valid_episode_index))
-
-    weighted_episode_coverage = 0.0
-    weighted_max_episode_fraction = 0.0
-    weighted_episode_perplexity = 0.0
-    weighted_mean_run_length = 0.0
-    weighted_max_run_length = 0.0
-    weighted_adjacent_repeat_fraction = 0.0
-    weighted_progress_bin_coverage = 0.0
-    rows: list[dict[str, Any]] = []
-
-    for bucket_id in np.flatnonzero(counts > 0).tolist():
-        bucket_rows = np.flatnonzero(bucket_index == bucket_id)
-        count = int(bucket_rows.shape[0])
-        fraction = float(count / total_rows)
-        bucket_eps = valid_episode_index[bucket_rows]
-        bucket_frames = valid_frame_index[bucket_rows]
-        bucket_progress_bins = progress_bin_index[bucket_rows]
-
-        unique_eps, episode_counts = np.unique(bucket_eps, return_counts=True)
-        probs = episode_counts.astype(np.float64, copy=False) / float(count)
-        entropy = -np.sum(np.where(probs > 0.0, probs * np.log(probs), 0.0))
-        episode_perplexity = float(np.exp(entropy))
-        max_episode_fraction = float(np.max(probs))
-        episode_coverage = float(unique_eps.shape[0] / max(total_episodes, 1))
-
-        run_lengths = []
-        run_start = 0
-        for idx in range(1, count):
-            same_episode = bucket_eps[idx] == bucket_eps[idx - 1]
-            consecutive_frame = bucket_frames[idx] == bucket_frames[idx - 1] + 1
-            if not (same_episode and consecutive_frame):
-                run_lengths.append(idx - run_start)
-                run_start = idx
-        run_lengths.append(count - run_start)
-        run_lengths_arr = np.asarray(run_lengths, dtype=np.int64)
-        adjacent_repeat_fraction = float(np.sum(np.maximum(run_lengths_arr - 1, 0)) / float(max(count - 1, 1)))
-        mean_run_length = float(np.mean(run_lengths_arr))
-        max_run_length = int(np.max(run_lengths_arr))
-        progress_bin_coverage = float(np.unique(bucket_progress_bins).shape[0] / float(max(progress_bins, 1)))
-
-        weighted_episode_coverage += episode_coverage * count
-        weighted_max_episode_fraction += max_episode_fraction * count
-        weighted_episode_perplexity += episode_perplexity * count
-        weighted_mean_run_length += mean_run_length * count
-        weighted_max_run_length += float(max_run_length) * count
-        weighted_adjacent_repeat_fraction += adjacent_repeat_fraction * count
-        weighted_progress_bin_coverage += progress_bin_coverage * count
-
-        rows.append(
-            {
-                "bucket_id": int(bucket_id),
-                "bucket_label": str(bucket_names[bucket_id]),
-                "count": count,
-                "fraction": fraction,
-                "unique_episodes": int(unique_eps.shape[0]),
-                "episode_coverage": episode_coverage,
-                "max_episode_fraction": max_episode_fraction,
-                "episode_perplexity": episode_perplexity,
-                "mean_run_length": mean_run_length,
-                "max_run_length": max_run_length,
-                "adjacent_repeat_fraction": adjacent_repeat_fraction,
-                "progress_bin_coverage": progress_bin_coverage,
-            }
-        )
-
-    stats_df = pd.DataFrame(rows).sort_values(
-        ["count", "episode_coverage", "max_episode_fraction"],
-        ascending=[False, False, True],
-        ignore_index=True,
-    )
-    summary = {
-        "total_rows": total_rows,
-        "total_buckets": int(bucket_names.shape[0]),
-        "active_buckets": int(np.sum(counts > 0)),
-        "weighted_mean_episode_coverage": float(weighted_episode_coverage / total_rows),
-        "weighted_mean_max_episode_fraction": float(weighted_max_episode_fraction / total_rows),
-        "weighted_mean_episode_perplexity": float(weighted_episode_perplexity / total_rows),
-        "weighted_mean_run_length": float(weighted_mean_run_length / total_rows),
-        "weighted_max_run_length": float(weighted_max_run_length / total_rows),
-        "weighted_adjacent_repeat_fraction": float(weighted_adjacent_repeat_fraction / total_rows),
-        "weighted_progress_bin_coverage": float(weighted_progress_bin_coverage / total_rows),
-        "bucket_episode_nmi": bucket_episode_nmi,
-        "progress_bins": int(progress_bins),
-        "total_episodes": total_episodes,
-    }
-    return stats_df, summary
-
-
-def _entropy_from_counts(counts: np.ndarray) -> float:
-    counts = np.asarray(counts, dtype=np.float64)
-    total = float(np.sum(counts))
-    if total <= 0.0:
-        return 0.0
-    probs = counts[counts > 0.0] / total
-    return float(-np.sum(probs * np.log(probs)))
-
-
-def make_action_kmeans_bucket_spec(
-    action_values: np.ndarray,
-    *,
-    target_name: str,
-    n_clusters: int,
-    fit_samples: int,
-    seed: int,
-) -> dict[str, Any]:
-    if n_clusters < 1:
-        raise ValueError("Action bucketing requires at least one cluster.")
-    if fit_samples < 1:
-        raise ValueError("Action bucketing requires at least one fit sample.")
-
-    n_rows = action_values.shape[0]
-    effective_clusters = min(int(n_clusters), int(n_rows))
-    rng = np.random.default_rng(seed)
-    fit_size = min(int(fit_samples), int(n_rows))
-    fit_idx = rng.choice(n_rows, size=fit_size, replace=False)
-
-    scaler = StandardScaler()
-    fit_values = scaler.fit_transform(action_values[fit_idx]).astype(np.float32, copy=False)
-    full_values = scaler.transform(action_values).astype(np.float32, copy=False)
-
-    batch_size = min(max(1024, 4 * effective_clusters), full_values.shape[0])
-    model = MiniBatchKMeans(
-        n_clusters=effective_clusters,
-        random_state=seed,
-        batch_size=batch_size,
-        n_init=3,
-        max_iter=100,
-    )
-    model.fit(fit_values)
-    bucket_index = model.predict(full_values).astype(np.int64, copy=False)
-    counts = np.bincount(bucket_index, minlength=effective_clusters).astype(np.int64, copy=False)
-    bucket_names = np.asarray([f"action_cluster_{bucket_id}" for bucket_id in range(effective_clusters)], dtype=object)
-    center_norms = np.linalg.norm(model.cluster_centers_.astype(np.float64, copy=False), axis=1)
-
-    return {
-        "action_target": target_name,
-        "action_bucket_kind": "kmeans",
-        "bucket_index": bucket_index,
-        "bucket_names": bucket_names,
-        "bucket_counts": counts,
-        "fit_rows": int(fit_size),
-        "requested_clusters": int(n_clusters),
-        "effective_clusters": int(effective_clusters),
-        "cluster_center_l2_norm_mean": float(np.mean(center_norms)),
-        "cluster_center_l2_norm_std": float(np.std(center_norms)),
-    }
-
-
-def compute_action_to_latent_statistics(
-    *,
-    action_bucket_index: np.ndarray,
-    action_bucket_names: np.ndarray,
-    latent_bucket_index: np.ndarray,
-    latent_bucket_names: np.ndarray,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    if action_bucket_index.shape[0] != latent_bucket_index.shape[0]:
-        raise ValueError("Action bucket indices and latent bucket indices must have the same number of rows.")
-    if action_bucket_names.ndim != 1:
-        raise ValueError(f"Expected 1D action bucket names array, got shape={action_bucket_names.shape}.")
-    if latent_bucket_names.ndim != 1:
-        raise ValueError(f"Expected 1D latent bucket names array, got shape={latent_bucket_names.shape}.")
-
-    total_rows = int(action_bucket_index.shape[0])
-    if total_rows == 0:
-        empty_df = pd.DataFrame(
-            columns=[
-                "action_bucket_id",
-                "action_bucket_label",
-                "count",
-                "fraction",
-                "active_latent_buckets",
-                "top_latent_bucket_id",
-                "top_latent_bucket_label",
-                "top_latent_fraction",
-                "latent_entropy",
-                "latent_perplexity",
-                "latent_buckets_for_80pct_mass",
-            ]
-        )
-        return empty_df, {
-            "total_rows": 0,
-            "action_total_buckets": int(action_bucket_names.shape[0]),
-            "action_active_buckets": 0,
-            "latent_total_buckets": int(latent_bucket_names.shape[0]),
-            "latent_active_buckets": 0,
-            "action_latent_nmi": 0.0,
-            "latent_given_action_entropy": 0.0,
-            "action_given_latent_entropy": 0.0,
-            "weighted_mean_active_latent_buckets": 0.0,
-            "weighted_mean_top_latent_fraction": 0.0,
-            "weighted_mean_latent_entropy": 0.0,
-            "weighted_mean_latent_perplexity": 0.0,
-            "weighted_mean_latent_buckets_for_80pct_mass": 0.0,
-        }
-
-    action_counts = np.bincount(action_bucket_index, minlength=int(action_bucket_names.shape[0])).astype(
-        np.int64, copy=False
-    )
-    latent_counts_global = np.bincount(latent_bucket_index, minlength=int(latent_bucket_names.shape[0])).astype(
-        np.int64, copy=False
-    )
-    mi = float(mutual_info_score(action_bucket_index, latent_bucket_index))
-    action_entropy = _entropy_from_counts(action_counts)
-    latent_entropy = _entropy_from_counts(latent_counts_global)
-    action_latent_nmi = float(normalized_mutual_info_score(action_bucket_index, latent_bucket_index))
-
-    weighted_active_latent_buckets = 0.0
-    weighted_top_latent_fraction = 0.0
-    weighted_latent_entropy = 0.0
-    weighted_latent_perplexity = 0.0
-    weighted_latent_buckets_for_80pct_mass = 0.0
-    rows: list[dict[str, Any]] = []
-
-    for action_bucket_id in np.flatnonzero(action_counts > 0).tolist():
-        bucket_rows = np.flatnonzero(action_bucket_index == action_bucket_id)
-        count = int(bucket_rows.shape[0])
-        fraction = float(count / total_rows)
-        latent_counts = np.bincount(
-            latent_bucket_index[bucket_rows], minlength=int(latent_bucket_names.shape[0])
-        ).astype(np.int64, copy=False)
-        active_latent_buckets = int(np.sum(latent_counts > 0))
-        top_latent_bucket_id = int(np.argmax(latent_counts))
-        top_latent_fraction = float(latent_counts[top_latent_bucket_id] / float(count))
-        bucket_latent_entropy = _entropy_from_counts(latent_counts)
-        bucket_latent_perplexity = float(np.exp(bucket_latent_entropy))
-        sorted_counts = np.sort(latent_counts[latent_counts > 0])[::-1]
-        if sorted_counts.shape[0] == 0:
-            latent_buckets_for_80pct_mass = 0
-        else:
-            coverage_counts = np.cumsum(sorted_counts, dtype=np.int64)
-            latent_buckets_for_80pct_mass = int(np.searchsorted(coverage_counts, int(np.ceil(0.8 * count))) + 1)
-
-        weighted_active_latent_buckets += active_latent_buckets * count
-        weighted_top_latent_fraction += top_latent_fraction * count
-        weighted_latent_entropy += bucket_latent_entropy * count
-        weighted_latent_perplexity += bucket_latent_perplexity * count
-        weighted_latent_buckets_for_80pct_mass += float(latent_buckets_for_80pct_mass) * count
-
-        rows.append(
-            {
-                "action_bucket_id": int(action_bucket_id),
-                "action_bucket_label": str(action_bucket_names[action_bucket_id]),
-                "count": count,
-                "fraction": fraction,
-                "active_latent_buckets": active_latent_buckets,
-                "top_latent_bucket_id": top_latent_bucket_id,
-                "top_latent_bucket_label": str(latent_bucket_names[top_latent_bucket_id]),
-                "top_latent_fraction": top_latent_fraction,
-                "latent_entropy": bucket_latent_entropy,
-                "latent_perplexity": bucket_latent_perplexity,
-                "latent_buckets_for_80pct_mass": latent_buckets_for_80pct_mass,
-            }
-        )
-
-    stats_df = pd.DataFrame(rows).sort_values(
-        ["top_latent_fraction", "latent_perplexity", "active_latent_buckets"],
-        ascending=[False, True, True],
-        ignore_index=True,
-    )
-    summary = {
-        "total_rows": total_rows,
-        "action_total_buckets": int(action_bucket_names.shape[0]),
-        "action_active_buckets": int(np.sum(action_counts > 0)),
-        "latent_total_buckets": int(latent_bucket_names.shape[0]),
-        "latent_active_buckets": int(np.sum(latent_counts_global > 0)),
-        "action_latent_nmi": action_latent_nmi,
-        "latent_given_action_entropy": float(weighted_latent_entropy / total_rows),
-        "action_given_latent_entropy": float(max(action_entropy - mi, 0.0)),
-        "weighted_mean_active_latent_buckets": float(weighted_active_latent_buckets / total_rows),
-        "weighted_mean_top_latent_fraction": float(weighted_top_latent_fraction / total_rows),
-        "weighted_mean_latent_entropy": float(weighted_latent_entropy / total_rows),
-        "weighted_mean_latent_perplexity": float(weighted_latent_perplexity / total_rows),
-        "weighted_mean_latent_buckets_for_80pct_mass": float(weighted_latent_buckets_for_80pct_mass / total_rows),
-    }
-    return stats_df, summary
-
-
-def make_discrete_bucket_spec(ids: np.ndarray, id_inverse: np.ndarray) -> dict[str, Any]:
-    unique_labels, first_indices = np.unique(id_inverse, return_index=True)
-    if unique_labels.shape[0] == 0:
-        raise ValueError("Expected at least one discrete bucket.")
-    if not np.array_equal(unique_labels, np.arange(unique_labels.shape[0], dtype=np.int64)):
-        raise ValueError("Discrete ID inverse labels must be dense and zero-based.")
-
-    bucket_names = np.asarray([format_sequence(seq) for seq in ids[first_indices]], dtype=object)
-    counts = np.bincount(id_inverse, minlength=bucket_names.shape[0]).astype(np.int64, copy=False)
-    return {
-        "feature_set": "id_sequence",
-        "bucket_kind": "discrete_sequence",
-        "bucket_index": id_inverse.astype(np.int64, copy=False),
-        "bucket_names": bucket_names,
-        "bucket_counts": counts,
-    }
-
-
-def make_continuous_bucket_spec(
-    continuous_flat: np.ndarray,
-    *,
-    n_clusters: int,
-    fit_samples: int,
-    seed: int,
-) -> dict[str, Any]:
-    if n_clusters < 1:
-        raise ValueError("Continuous bucketing requires at least one cluster.")
-    if fit_samples < 1:
-        raise ValueError("Continuous bucketing requires at least one fit sample.")
-
-    n_rows = continuous_flat.shape[0]
-    effective_clusters = min(int(n_clusters), int(n_rows))
-    rng = np.random.default_rng(seed)
-    fit_size = min(int(fit_samples), int(n_rows))
-    fit_idx = rng.choice(n_rows, size=fit_size, replace=False)
-
-    scaler = StandardScaler()
-    fit_values = scaler.fit_transform(continuous_flat[fit_idx]).astype(np.float32, copy=False)
-    full_values = scaler.transform(continuous_flat).astype(np.float32, copy=False)
-
-    batch_size = min(max(1024, 4 * effective_clusters), full_values.shape[0])
-    model = MiniBatchKMeans(
-        n_clusters=effective_clusters,
-        random_state=seed,
-        batch_size=batch_size,
-        n_init=3,
-        max_iter=100,
-    )
-    model.fit(fit_values)
-    bucket_index = model.predict(full_values).astype(np.int64, copy=False)
-    counts = np.bincount(bucket_index, minlength=effective_clusters).astype(np.int64, copy=False)
-    bucket_names = np.asarray([f"cluster_{bucket_id}" for bucket_id in range(effective_clusters)], dtype=object)
-    center_norms = np.linalg.norm(model.cluster_centers_.astype(np.float64, copy=False), axis=1)
-
-    return {
-        "feature_set": "continuous_kmeans",
-        "bucket_kind": "kmeans",
-        "bucket_index": bucket_index,
-        "bucket_names": bucket_names,
-        "bucket_counts": counts,
-        "fit_rows": int(fit_size),
-        "requested_clusters": int(n_clusters),
-        "effective_clusters": int(effective_clusters),
-        "cluster_center_l2_norm_mean": float(np.mean(center_norms)),
-        "cluster_center_l2_norm_std": float(np.std(center_norms)),
-    }
-
-
-def run_action_bucket_analysis(
-    *,
-    bucket_specs: list[dict[str, Any]],
-    action_targets: dict[str, np.ndarray],
-    output_dir: Path,
-    top_k: int,
-) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
-    summary_rows: list[dict[str, Any]] = []
-    json_summary: dict[str, dict[str, Any]] = {}
-
-    for bucket_spec in bucket_specs:
-        feature_set = str(bucket_spec["feature_set"])
-        bucket_index = np.asarray(bucket_spec["bucket_index"], dtype=np.int64)
-        bucket_names = np.asarray(bucket_spec["bucket_names"], dtype=object)
-        bucket_counts = np.asarray(bucket_spec["bucket_counts"], dtype=np.int64)
-        feature_summary: dict[str, Any] = {
-            "bucket_kind": str(bucket_spec["bucket_kind"]),
-            "total_buckets": int(bucket_names.shape[0]),
-            "active_buckets": int(np.sum(bucket_counts > 0)),
-            "singleton_buckets": int(np.sum(bucket_counts == 1)),
-            "max_bucket_usage": int(np.max(bucket_counts)) if bucket_counts.shape[0] > 0 else 0,
-            "max_bucket_fraction": float(np.max(bucket_counts) / bucket_index.shape[0]) if bucket_index.shape[0] > 0 and bucket_counts.shape[0] > 0 else 0.0,
-            "targets": {},
-        }
-        for key in ("fit_rows", "requested_clusters", "effective_clusters", "cluster_center_l2_norm_mean", "cluster_center_l2_norm_std"):
-            if key in bucket_spec:
-                feature_summary[key] = bucket_spec[key]
-
-        for target_name, target_values in action_targets.items():
-            stats_df, target_summary = compute_bucket_action_statistics(
-                bucket_index=bucket_index,
-                bucket_names=bucket_names,
-                target_values=target_values,
-            )
-            stats_path = output_dir / f"action_buckets__{feature_set}__{target_name}.csv"
-            stats_df.to_csv(stats_path, index=False)
-            summary_rows.append(
-                {
-                    "feature_set": feature_set,
-                    "bucket_kind": str(bucket_spec["bucket_kind"]),
-                    "target": target_name,
-                    "total_buckets": int(feature_summary["total_buckets"]),
-                    "active_buckets": int(target_summary["active_buckets"]),
-                    "singleton_buckets": int(target_summary["singleton_buckets"]),
-                    "max_bucket_usage": int(target_summary["max_bucket_usage"]),
-                    "max_bucket_fraction": float(target_summary["max_bucket_fraction"]),
-                    "mean_variance_explained": float(target_summary["mean_variance_explained"]),
-                    "mean_within_bucket_std": float(target_summary["mean_within_bucket_std"]),
-                }
-            )
-            feature_summary["targets"][target_name] = {
-                **target_summary,
-                "artifact": stats_path.name,
-                "top_rows": stats_df.head(top_k).to_dict(orient="records"),
-            }
-        json_summary[feature_set] = feature_summary
-
-    summary_df = pd.DataFrame(summary_rows).sort_values(
-        ["mean_variance_explained", "max_bucket_fraction"],
-        ascending=[False, False],
-        ignore_index=True,
-    )
-    summary_df.to_csv(output_dir / "action_bucket_summary.csv", index=False)
-    return summary_df, json_summary
-
-
-def run_bucket_context_analysis(
-    *,
-    bucket_specs: list[dict[str, Any]],
-    valid_episode_index: np.ndarray,
-    valid_frame_index: np.ndarray,
-    valid_progress_index: np.ndarray,
-    valid_episode_lengths: np.ndarray,
-    progress_bins: int,
-    output_dir: Path,
-    top_k: int,
-) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
-    summary_rows: list[dict[str, Any]] = []
-    json_summary: dict[str, dict[str, Any]] = {}
-
-    for bucket_spec in bucket_specs:
-        feature_set = str(bucket_spec["feature_set"])
-        bucket_index = np.asarray(bucket_spec["bucket_index"], dtype=np.int64)
-        bucket_names = np.asarray(bucket_spec["bucket_names"], dtype=object)
-        stats_df, feature_summary = compute_bucket_context_statistics(
-            bucket_index=bucket_index,
-            bucket_names=bucket_names,
-            valid_episode_index=valid_episode_index,
-            valid_frame_index=valid_frame_index,
-            valid_progress_index=valid_progress_index,
-            valid_episode_lengths=valid_episode_lengths,
-            progress_bins=progress_bins,
-        )
-        stats_path = output_dir / f"bucket_context__{feature_set}.csv"
-        stats_df.to_csv(stats_path, index=False)
-        summary_rows.append(
-            {
-                "feature_set": feature_set,
-                "bucket_kind": str(bucket_spec["bucket_kind"]),
-                "total_buckets": int(feature_summary["total_buckets"]),
-                "active_buckets": int(feature_summary["active_buckets"]),
-                "bucket_episode_nmi": float(feature_summary["bucket_episode_nmi"]),
-                "weighted_mean_episode_coverage": float(feature_summary["weighted_mean_episode_coverage"]),
-                "weighted_mean_max_episode_fraction": float(feature_summary["weighted_mean_max_episode_fraction"]),
-                "weighted_mean_episode_perplexity": float(feature_summary["weighted_mean_episode_perplexity"]),
-                "weighted_mean_run_length": float(feature_summary["weighted_mean_run_length"]),
-                "weighted_max_run_length": float(feature_summary["weighted_max_run_length"]),
-                "weighted_adjacent_repeat_fraction": float(feature_summary["weighted_adjacent_repeat_fraction"]),
-                "weighted_progress_bin_coverage": float(feature_summary["weighted_progress_bin_coverage"]),
-            }
-        )
-        json_summary[feature_set] = {
-            "bucket_kind": str(bucket_spec["bucket_kind"]),
-            **feature_summary,
-            "artifact": stats_path.name,
-            "top_rows": stats_df.head(top_k).to_dict(orient="records"),
-        }
-
-    summary_df = pd.DataFrame(summary_rows).sort_values(
-        ["weighted_mean_episode_coverage", "weighted_mean_max_episode_fraction"],
-        ascending=[False, True],
-        ignore_index=True,
-    )
-    summary_df.to_csv(output_dir / "bucket_context_summary.csv", index=False)
-    return summary_df, json_summary
-
-
-def run_action_to_latent_analysis(
-    *,
-    action_bucket_specs: list[dict[str, Any]],
-    latent_bucket_specs: list[dict[str, Any]],
-    output_dir: Path,
-    top_k: int,
-) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
-    summary_rows: list[dict[str, Any]] = []
-    json_summary: dict[str, dict[str, Any]] = {}
-
-    for action_bucket_spec in action_bucket_specs:
-        action_target = str(action_bucket_spec["action_target"])
-        action_bucket_index = np.asarray(action_bucket_spec["bucket_index"], dtype=np.int64)
-        action_bucket_names = np.asarray(action_bucket_spec["bucket_names"], dtype=object)
-        target_summary: dict[str, Any] = {
-            "action_bucket_kind": str(action_bucket_spec["action_bucket_kind"]),
-            "action_total_buckets": int(action_bucket_names.shape[0]),
-            "action_active_buckets": int(np.sum(np.asarray(action_bucket_spec["bucket_counts"], dtype=np.int64) > 0)),
-            "latent_feature_sets": {},
-        }
-        for key in ("fit_rows", "requested_clusters", "effective_clusters", "cluster_center_l2_norm_mean", "cluster_center_l2_norm_std"):
-            if key in action_bucket_spec:
-                target_summary[key] = action_bucket_spec[key]
-
-        for latent_bucket_spec in latent_bucket_specs:
-            feature_set = str(latent_bucket_spec["feature_set"])
-            stats_df, pair_summary = compute_action_to_latent_statistics(
-                action_bucket_index=action_bucket_index,
-                action_bucket_names=action_bucket_names,
-                latent_bucket_index=np.asarray(latent_bucket_spec["bucket_index"], dtype=np.int64),
-                latent_bucket_names=np.asarray(latent_bucket_spec["bucket_names"], dtype=object),
-            )
-            stats_path = output_dir / f"action_to_latent__{action_target}__to__{feature_set}.csv"
-            stats_df.to_csv(stats_path, index=False)
-            summary_rows.append(
-                {
-                    "action_target": action_target,
-                    "action_bucket_kind": str(action_bucket_spec["action_bucket_kind"]),
-                    "action_total_buckets": int(pair_summary["action_total_buckets"]),
-                    "action_active_buckets": int(pair_summary["action_active_buckets"]),
-                    "latent_feature_set": feature_set,
-                    "latent_bucket_kind": str(latent_bucket_spec["bucket_kind"]),
-                    "latent_total_buckets": int(pair_summary["latent_total_buckets"]),
-                    "latent_active_buckets": int(pair_summary["latent_active_buckets"]),
-                    "action_latent_nmi": float(pair_summary["action_latent_nmi"]),
-                    "latent_given_action_entropy": float(pair_summary["latent_given_action_entropy"]),
-                    "action_given_latent_entropy": float(pair_summary["action_given_latent_entropy"]),
-                    "weighted_mean_active_latent_buckets": float(pair_summary["weighted_mean_active_latent_buckets"]),
-                    "weighted_mean_top_latent_fraction": float(pair_summary["weighted_mean_top_latent_fraction"]),
-                    "weighted_mean_latent_entropy": float(pair_summary["weighted_mean_latent_entropy"]),
-                    "weighted_mean_latent_perplexity": float(pair_summary["weighted_mean_latent_perplexity"]),
-                    "weighted_mean_latent_buckets_for_80pct_mass": float(
-                        pair_summary["weighted_mean_latent_buckets_for_80pct_mass"]
-                    ),
-                }
-            )
-            target_summary["latent_feature_sets"][feature_set] = {
-                "latent_bucket_kind": str(latent_bucket_spec["bucket_kind"]),
-                **pair_summary,
-                "artifact": stats_path.name,
-                "top_rows": stats_df.head(top_k).to_dict(orient="records"),
-            }
-
-        json_summary[action_target] = target_summary
-
-    summary_df = pd.DataFrame(summary_rows).sort_values(
-        ["weighted_mean_top_latent_fraction", "latent_given_action_entropy"],
-        ascending=[False, True],
-        ignore_index=True,
-    )
-    summary_df.to_csv(output_dir / "action_to_latent_summary.csv", index=False)
-    return summary_df, json_summary
-
-
-def build_probe_feature_sets(
-    *,
-    ids: np.ndarray | None,
-    codebook_vectors_flat: np.ndarray | None,
-    continuous_flat: np.ndarray | None,
-    enabled_feature_sets: set[str] | None = None,
-) -> dict[str, np.ndarray]:
-    if enabled_feature_sets is None:
-        enabled_feature_sets = {"ids_onehot", "codebook_vectors", "continuous"}
-    feature_sets = {}
-    if ids is not None and "ids_onehot" in enabled_feature_sets:
-        feature_sets["ids_onehot"] = ids
-    if codebook_vectors_flat is not None and "codebook_vectors" in enabled_feature_sets:
-        feature_sets["codebook_vectors"] = codebook_vectors_flat
-    if continuous_flat is not None and "continuous" in enabled_feature_sets:
-        feature_sets["continuous"] = continuous_flat
-    if not feature_sets:
-        raise ValueError("At least one feature set is required for action probes.")
-    return feature_sets
-
-
-def _select_episode_rows(
-    valid_episode_index: np.ndarray,
-    max_samples: int,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    unique_eps, counts = np.unique(valid_episode_index, return_counts=True)
-    if unique_eps.shape[0] < 2:
-        raise ValueError("Episode-split action probes require at least two valid episodes.")
-    if max_samples >= valid_episode_index.shape[0]:
-        return np.arange(valid_episode_index.shape[0], dtype=np.int64)
-
-    order = rng.permutation(unique_eps.shape[0])
-    selected_eps = []
-    running_total = 0
-    for order_idx in order:
-        selected_eps.append(unique_eps[order_idx])
-        running_total += int(counts[order_idx])
-        if running_total >= max_samples and len(selected_eps) >= 2:
-            break
-
-    mask = np.isin(valid_episode_index, np.asarray(selected_eps, dtype=np.int64))
-    selected_rows = np.flatnonzero(mask).astype(np.int64, copy=False)
-    if selected_rows.shape[0] == 0:
-        raise ValueError("Failed to select any rows for the episode-split probe.")
-    return selected_rows
+def select_device(requested: str) -> torch.device:
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        print("CUDA requested but unavailable; using CPU.", file=sys.stderr)
+        return torch.device("cpu")
+    return torch.device(requested)
 
 
 def make_probe_split(
     valid_episode_index: np.ndarray,
     max_samples: int,
     test_size: float,
+    val_size: float,
     seed: int,
     mode: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    if valid_episode_index.shape[0] < 2:
-        raise ValueError("Action probes require at least two valid rows.")
+) -> ProbeSplit:
+    if valid_episode_index.shape[0] < 3:
+        raise ValueError("Action probes require at least three valid rows.")
     if max_samples < 0:
         raise ValueError("--probe-max-samples must be >= 0.")
     effective_max_samples = valid_episode_index.shape[0] if max_samples == 0 else max_samples
-
     rng = np.random.default_rng(seed)
+
     if mode == "row":
         sample_size = min(effective_max_samples, valid_episode_index.shape[0])
         sampled_rows = rng.choice(valid_episode_index.shape[0], size=sample_size, replace=False)
-        train_rows, test_rows = train_test_split(sampled_rows, test_size=test_size, random_state=seed, shuffle=True)
-        return (
-            np.sort(np.asarray(train_rows, dtype=np.int64)),
-            np.sort(np.asarray(test_rows, dtype=np.int64)),
+        train_val_rows, test_rows = train_test_split(
+            sampled_rows,
+            test_size=test_size,
+            random_state=seed,
+            shuffle=True,
         )
+        relative_val_size = val_size / max(1.0 - test_size, 1e-8)
+        train_rows, val_rows = train_test_split(
+            train_val_rows,
+            test_size=relative_val_size,
+            random_state=seed + 1,
+            shuffle=True,
+        )
+        return ProbeSplit(np.sort(train_rows), np.sort(test_rows), np.sort(val_rows))
 
     if mode != "episode":
         raise ValueError(f"Unsupported probe split mode: {mode!r}")
 
-    selected_rows = _select_episode_rows(valid_episode_index, max_samples=effective_max_samples, rng=rng)
-    selected_eps = np.unique(valid_episode_index[selected_rows])
-    if selected_eps.shape[0] < 2:
-        raise ValueError("Episode-split action probes require at least two valid episodes after sampling.")
+    unique_eps, counts = np.unique(valid_episode_index, return_counts=True)
+    if unique_eps.shape[0] < 3:
+        raise ValueError("Episode-split probes require at least three valid episodes.")
+    if effective_max_samples < valid_episode_index.shape[0]:
+        order = rng.permutation(unique_eps.shape[0])
+        selected_eps = []
+        running_total = 0
+        for order_idx in order:
+            selected_eps.append(unique_eps[order_idx])
+            running_total += int(counts[order_idx])
+            if running_total >= effective_max_samples and len(selected_eps) >= 3:
+                break
+        selected_eps = np.asarray(selected_eps, dtype=np.int64)
+    else:
+        selected_eps = unique_eps
 
-    train_eps, test_eps = train_test_split(selected_eps, test_size=test_size, random_state=seed, shuffle=True)
-    train_rows = selected_rows[np.isin(valid_episode_index[selected_rows], train_eps)]
-    test_rows = selected_rows[np.isin(valid_episode_index[selected_rows], test_eps)]
-    if train_rows.shape[0] == 0 or test_rows.shape[0] == 0:
-        raise ValueError("Episode-split action probes produced an empty train or test split.")
-    return np.sort(train_rows.astype(np.int64, copy=False)), np.sort(test_rows.astype(np.int64, copy=False))
+    train_val_eps, test_eps = train_test_split(selected_eps, test_size=test_size, random_state=seed, shuffle=True)
+    relative_val_size = val_size / max(1.0 - test_size, 1e-8)
+    train_eps, val_eps = train_test_split(
+        train_val_eps,
+        test_size=relative_val_size,
+        random_state=seed + 1,
+        shuffle=True,
+    )
+    train_rows = np.flatnonzero(np.isin(valid_episode_index, train_eps)).astype(np.int64, copy=False)
+    test_rows = np.flatnonzero(np.isin(valid_episode_index, test_eps)).astype(np.int64, copy=False)
+    val_rows = np.flatnonzero(np.isin(valid_episode_index, val_eps)).astype(np.int64, copy=False)
+    if train_rows.shape[0] == 0 or test_rows.shape[0] == 0 or val_rows.shape[0] == 0:
+        raise ValueError("Probe split produced an empty train, validation, or test set.")
+    return ProbeSplit(np.sort(train_rows), np.sort(test_rows), np.sort(val_rows))
 
 
-def transform_probe_features(
+def make_dense_id_features(ids: np.ndarray, train_rows: np.ndarray, other_rows: list[np.ndarray]) -> list[np.ndarray]:
+    """One-hot encode ID positions with train-fit categories.
+
+    This is dense by design because torch linear/MLP probes operate on dense
+    tensors. Use it for small discrete configurations, not huge seq1/cb4096 full
+    datasets unless memory is acceptable.
+    """
+    train_ids = ids[train_rows]
+    categories = [np.unique(train_ids[:, pos]) for pos in range(train_ids.shape[1])]
+    offsets = np.cumsum([0] + [len(cat) for cat in categories[:-1]])
+    total_dim = int(sum(len(cat) for cat in categories))
+    encoded_arrays = []
+    for rows in [train_rows, *other_rows]:
+        encoded = np.zeros((rows.shape[0], total_dim), dtype=np.float32)
+        values = ids[rows]
+        for pos, cat in enumerate(categories):
+            local = np.searchsorted(cat, values[:, pos])
+            in_range = (local < len(cat)) & (cat[np.clip(local, 0, len(cat) - 1)] == values[:, pos])
+            encoded[np.flatnonzero(in_range), offsets[pos] + local[in_range]] = 1.0
+        encoded_arrays.append(encoded)
+    return encoded_arrays
+
+
+def standardize_from_train(
+    train_values: np.ndarray,
+    test_values: np.ndarray,
+    val_values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    mean = train_values.mean(axis=0, keepdims=True, dtype=np.float64).astype(np.float32)
+    std = train_values.std(axis=0, keepdims=True, dtype=np.float64).astype(np.float32)
+    std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
+    return (
+        ((train_values - mean) / std).astype(np.float32, copy=False),
+        ((test_values - mean) / std).astype(np.float32, copy=False),
+        ((val_values - mean) / std).astype(np.float32, copy=False),
+        mean.squeeze(0),
+        std.squeeze(0),
+    )
+
+
+def build_feature_arrays(
+    *,
     feature_name: str,
-    x_train: np.ndarray,
-    x_test: np.ndarray,
-    *,
-    model_name: str,
-) -> tuple[Any, Any]:
+    features: np.ndarray,
+    split: ProbeSplit,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if feature_name == "ids_onehot":
-        encoder = make_one_hot_encoder()
-        x_train_transformed = encoder.fit_transform(x_train)
-        x_test_transformed = encoder.transform(x_test)
-        if model_name == "mlp":
-            x_train_transformed = x_train_transformed.toarray().astype(np.float32, copy=False)
-            x_test_transformed = x_test_transformed.toarray().astype(np.float32, copy=False)
-        return x_train_transformed, x_test_transformed
-
-    scaler = StandardScaler()
-    x_train_transformed = scaler.fit_transform(x_train).astype(np.float32, copy=False)
-    x_test_transformed = scaler.transform(x_test).astype(np.float32, copy=False)
-    return x_train_transformed, x_test_transformed
+        return tuple(make_dense_id_features(features, split.train_rows, [split.test_rows, split.val_rows]))  # type: ignore[return-value]
+    train_x = features[split.train_rows]
+    test_x = features[split.test_rows]
+    val_x = features[split.val_rows]
+    return standardize_from_train(train_x, test_x, val_x)[:3]
 
 
-def _score_probe_predictions(
+def r2_and_mse(y_true: np.ndarray, y_pred: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    y_true64 = y_true.astype(np.float64, copy=False)
+    y_pred64 = y_pred.astype(np.float64, copy=False)
+    residual = np.sum((y_true64 - y_pred64) ** 2, axis=0)
+    centered = np.sum((y_true64 - y_true64.mean(axis=0, keepdims=True)) ** 2, axis=0)
+    r2 = 1.0 - residual / np.maximum(centered, 1e-12)
+    mse = np.mean((y_true64 - y_pred64) ** 2, axis=0)
+    return r2.astype(np.float64, copy=False), mse.astype(np.float64, copy=False)
+
+
+def score_predictions(
     *,
+    probe_model: str,
     feature_name: str,
     target_name: str,
+    split_mode: str,
     y_test: np.ndarray,
     prediction: np.ndarray,
-    probe_model: str,
-    split_mode: str,
     n_train: int,
     n_test: int,
+    n_val: int,
+    train_seconds: float,
+    epochs: int | None,
 ) -> list[dict[str, Any]]:
-    raw_r2 = r2_score(y_test, prediction, multioutput="raw_values")
-    avg_r2 = r2_score(y_test, prediction, multioutput="uniform_average")
-    raw_mse = mean_squared_error(y_test, prediction, multioutput="raw_values")
-    avg_mse = mean_squared_error(y_test, prediction, multioutput="uniform_average")
-    rows = []
-    for action_dim, (r2_value, mse_value) in enumerate(zip(raw_r2.tolist(), raw_mse.tolist(), strict=True)):
-        rows.append(
-            {
-                "probe_model": probe_model,
-                "split_mode": split_mode,
-                "feature_set": feature_name,
-                "target": target_name,
-                "action_dim": action_dim,
-                "r2": float(r2_value),
-                "avg_r2_for_target": float(avg_r2),
-                "mse": float(mse_value),
-                "avg_mse_for_target": float(avg_mse),
-                "n_train": int(n_train),
-                "n_test": int(n_test),
-            }
-        )
-    return rows
+    r2, mse = r2_and_mse(y_test, prediction)
+    avg_r2 = float(np.mean(r2))
+    avg_mse = float(np.mean(mse))
+    return [
+        {
+            "probe_model": probe_model,
+            "split_mode": split_mode,
+            "feature_set": feature_name,
+            "target": target_name,
+            "action_dim": action_dim,
+            "r2": float(r2_value),
+            "avg_r2_for_target": avg_r2,
+            "mse": float(mse_value),
+            "avg_mse_for_target": avg_mse,
+            "n_train": int(n_train),
+            "n_test": int(n_test),
+            "n_val": int(n_val),
+            "train_seconds": float(train_seconds),
+            "epochs": None if epochs is None else int(epochs),
+        }
+        for action_dim, (r2_value, mse_value) in enumerate(zip(r2.tolist(), mse.tolist(), strict=True))
+    ]
 
 
-def fit_ridge_probe(
-    feature_sets: dict[str, np.ndarray],
-    targets: dict[str, np.ndarray],
-    train_rows: np.ndarray,
-    test_rows: np.ndarray,
-    ridge_alpha: float,
-    split_mode: str,
-) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for feature_name, features in feature_sets.items():
-        x_train = features[train_rows]
-        x_test = features[test_rows]
-        x_train_transformed, x_test_transformed = transform_probe_features(
-            feature_name,
-            x_train,
-            x_test,
-            model_name="ridge",
-        )
-        model = Ridge(alpha=ridge_alpha)
-        for target_name, target_values in targets.items():
-            y_train = target_values[train_rows]
-            y_test = target_values[test_rows]
-            model.fit(x_train_transformed, y_train)
-            prediction = model.predict(x_test_transformed)
-            rows.extend(
-                _score_probe_predictions(
-                    feature_name=feature_name,
-                    target_name=target_name,
-                    y_test=y_test,
-                    prediction=prediction,
-                    probe_model="ridge",
-                    split_mode=split_mode,
-                    n_train=len(train_rows),
-                    n_test=len(test_rows),
-                )
-            )
-    return pd.DataFrame(rows)
-
-
-def fit_mlp_probe(
-    feature_sets: dict[str, np.ndarray],
-    targets: dict[str, np.ndarray],
-    train_rows: np.ndarray,
-    test_rows: np.ndarray,
-    split_mode: str,
+def fit_ridge_torch(
     *,
-    hidden_layer_sizes: tuple[int, ...],
+    x_train: np.ndarray,
+    x_test: np.ndarray,
+    y_train: np.ndarray,
     alpha: float,
-    max_iter: int,
-    early_stopping: bool,
-    n_iter_no_change: int,
-    seed: int,
-) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for feature_name, features in feature_sets.items():
-        x_train = features[train_rows]
-        x_test = features[test_rows]
-        x_train_transformed, x_test_transformed = transform_probe_features(
-            feature_name,
-            x_train,
-            x_test,
-            model_name="mlp",
-        )
-        model = MLPRegressor(
-            hidden_layer_sizes=hidden_layer_sizes,
-            activation="relu",
-            solver="adam",
-            alpha=alpha,
-            batch_size="auto",
-            learning_rate="constant",
-            learning_rate_init=1e-3,
-            max_iter=max_iter,
-            shuffle=True,
-            random_state=seed,
-            early_stopping=early_stopping,
-            n_iter_no_change=n_iter_no_change,
-            validation_fraction=0.1,
-        )
-        for target_name, target_values in targets.items():
-            y_train = target_values[train_rows]
-            y_test = target_values[test_rows]
-            model.fit(x_train_transformed, y_train)
-            prediction = model.predict(x_test_transformed)
-            rows.extend(
-                _score_probe_predictions(
-                    feature_name=feature_name,
-                    target_name=target_name,
-                    y_test=y_test,
-                    prediction=np.asarray(prediction, dtype=np.float32),
-                    probe_model="mlp",
-                    split_mode=split_mode,
-                    n_train=len(train_rows),
-                    n_test=len(test_rows),
-                )
-            )
-    return pd.DataFrame(rows)
+    device: torch.device,
+) -> np.ndarray:
+    x_train_t = torch.as_tensor(x_train, dtype=torch.float32, device=device)
+    y_train_t = torch.as_tensor(y_train, dtype=torch.float32, device=device)
+    x_test_t = torch.as_tensor(x_test, dtype=torch.float32, device=device)
+    y_mean = y_train_t.mean(dim=0, keepdim=True)
+    y_centered = y_train_t - y_mean
+    gram = x_train_t.T @ x_train_t
+    eye = torch.eye(gram.shape[0], dtype=torch.float32, device=device)
+    weights = torch.linalg.solve(gram + float(alpha) * eye, x_train_t.T @ y_centered)
+    prediction = x_test_t @ weights + y_mean
+    return prediction.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
-def run_action_probes(
+class MLPProbe(torch.nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, hidden_dims: tuple[int, ...]) -> None:
+        super().__init__()
+        layers: list[torch.nn.Module] = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.extend([torch.nn.Linear(prev_dim, hidden_dim), torch.nn.ReLU()])
+            prev_dim = hidden_dim
+        layers.append(torch.nn.Linear(prev_dim, output_dim))
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def fit_mlp_torch(
     *,
-    ids: np.ndarray | None,
-    codebook_vectors_flat: np.ndarray | None,
-    continuous_flat: np.ndarray | None,
-    valid_episode_index: np.ndarray,
-    targets: dict[str, np.ndarray],
-    max_samples: int,
-    test_size: float,
-    probe_model: str,
-    split_mode: str,
-    ridge_alpha: float,
-    mlp_hidden_layer_sizes: tuple[int, ...],
-    mlp_alpha: float,
-    mlp_max_iter: int,
-    mlp_early_stopping: bool,
-    mlp_n_iter_no_change: int,
-    enabled_feature_sets: set[str] | None,
+    x_train: np.ndarray,
+    x_test: np.ndarray,
+    x_val: np.ndarray,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    y_val: np.ndarray,
+    hidden_dims: tuple[int, ...],
+    alpha: float,
+    max_epochs: int,
+    batch_size: int,
+    lr: float,
+    early_stopping: bool,
+    patience: int,
     seed: int,
-) -> pd.DataFrame:
-    train_rows, test_rows = make_probe_split(
-        valid_episode_index,
-        max_samples=max_samples,
-        test_size=test_size,
-        seed=seed,
-        mode=split_mode,
-    )
-    feature_sets = build_probe_feature_sets(
-        ids=ids,
-        codebook_vectors_flat=codebook_vectors_flat,
-        continuous_flat=continuous_flat,
-        enabled_feature_sets=enabled_feature_sets,
-    )
+    device: torch.device,
+) -> tuple[np.ndarray, int, float, float]:
+    torch.manual_seed(seed)
+    model = MLPProbe(x_train.shape[1], y_train.shape[1], hidden_dims).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=alpha)
+    loss_fn = torch.nn.MSELoss()
+    train_x = torch.as_tensor(x_train, dtype=torch.float32)
+    train_y = torch.as_tensor(y_train, dtype=torch.float32)
+    val_x = torch.as_tensor(x_val, dtype=torch.float32, device=device)
+    val_y = torch.as_tensor(y_val, dtype=torch.float32, device=device)
+    test_x = torch.as_tensor(x_test, dtype=torch.float32, device=device)
 
-    frames = []
-    if probe_model in {"ridge", "both"}:
-        frames.append(
-            fit_ridge_probe(
-                feature_sets,
-                targets,
-                train_rows,
-                test_rows,
-                ridge_alpha=ridge_alpha,
-                split_mode=split_mode,
-            )
-        )
-    if probe_model in {"mlp", "both"}:
-        frames.append(
-            fit_mlp_probe(
-                feature_sets,
-                targets,
-                train_rows,
-                test_rows,
-                split_mode=split_mode,
-                hidden_layer_sizes=mlp_hidden_layer_sizes,
-                alpha=mlp_alpha,
-                max_iter=mlp_max_iter,
-                early_stopping=mlp_early_stopping,
-                n_iter_no_change=mlp_n_iter_no_change,
-                seed=seed,
-            )
-        )
-    if not frames:
-        raise ValueError(f"Unsupported probe model choice: {probe_model!r}")
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    best_val = float("inf")
+    best_epoch = 0
+    stale_epochs = 0
+    start_time = time.time()
 
-    return (
-        pd.concat(frames, ignore_index=True)
-        .sort_values(["probe_model", "feature_set", "target", "action_dim"], ignore_index=True)
-    )
+    for epoch in range(1, max_epochs + 1):
+        permutation = torch.randperm(train_x.shape[0], generator=generator)
+        model.train()
+        for start in range(0, train_x.shape[0], batch_size):
+            batch_rows = permutation[start : start + batch_size]
+            xb = train_x[batch_rows].to(device, non_blocking=True)
+            yb = train_y[batch_rows].to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            loss = loss_fn(model(xb), yb)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_loss = float(loss_fn(model(val_x), val_y).detach().cpu())
+        if val_loss < best_val - 1e-8:
+            best_val = val_loss
+            best_epoch = epoch
+            stale_epochs = 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            stale_epochs += 1
+        if early_stopping and stale_epochs >= patience:
+            break
+
+    model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    model.eval()
+    with torch.no_grad():
+        prediction = model(test_x).detach().cpu().numpy().astype(np.float32, copy=False)
+    train_seconds = time.time() - start_time
+    return prediction, best_epoch, best_val, train_seconds
 
 
 def summarize_probe_scores(probe_df: pd.DataFrame) -> pd.DataFrame:
     return (
         probe_df.groupby(["probe_model", "split_mode", "feature_set", "target"], as_index=False)
-        .agg(mean_r2=("r2", "mean"), mean_mse=("mse", "mean"))
+        .agg(
+            mean_r2=("r2", "mean"),
+            mean_mse=("mse", "mean"),
+            n_train=("n_train", "first"),
+            n_test=("n_test", "first"),
+            n_val=("n_val", "first"),
+            train_seconds=("train_seconds", "first"),
+            epochs=("epochs", "first"),
+        )
         .sort_values(["probe_model", "mean_r2", "mean_mse"], ascending=[True, False, True], ignore_index=True)
     )
 
 
-def plot_probe_heatmaps(probe_df: pd.DataFrame, output_dir: Path) -> list[str]:
-    written = []
-    groups = list(probe_df.groupby(["probe_model", "split_mode"], sort=True))
-    for (probe_model, split_mode), group_df in groups:
-        row_label_df = group_df.assign(row_label=lambda df: df["feature_set"] + " -> " + df["target"])
-        r2_pivot = (
-            row_label_df.pivot_table(index="row_label", columns="action_dim", values="r2", aggfunc="mean").sort_index()
-        )
-        mse_pivot = (
-            row_label_df.pivot_table(index="row_label", columns="action_dim", values="mse", aggfunc="mean").sort_index()
-        )
-        r2_path = output_dir / f"action_probe_r2_heatmap__{probe_model}__{split_mode}.png"
-        mse_path = output_dir / f"action_probe_mse_heatmap__{probe_model}__{split_mode}.png"
-        plot_heatmap(
-            r2_pivot.to_numpy(),
-            r2_pivot.index.tolist(),
-            [f"a{int(col)}" for col in r2_pivot.columns.tolist()],
-            f"Held-Out Action Probe R^2 ({probe_model}, split={split_mode})",
-            "R^2",
-            r2_path,
-        )
-        plot_heatmap(
-            mse_pivot.to_numpy(),
-            mse_pivot.index.tolist(),
-            [f"a{int(col)}" for col in mse_pivot.columns.tolist()],
-            f"Held-Out Action Probe MSE ({probe_model}, split={split_mode})",
-            "MSE",
-            mse_path,
-        )
-        written.extend([r2_path.name, mse_path.name])
+def run_probes(
+    *,
+    feature_sets: dict[str, np.ndarray],
+    targets: dict[str, np.ndarray],
+    split: ProbeSplit,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for feature_name, features in feature_sets.items():
+        x_train, x_test, x_val = build_feature_arrays(feature_name=feature_name, features=features, split=split)
+        for target_name, target_values in targets.items():
+            y_train = target_values[split.train_rows].astype(np.float32, copy=False)
+            y_test = target_values[split.test_rows].astype(np.float32, copy=False)
+            y_val = target_values[split.val_rows].astype(np.float32, copy=False)
 
-        if len(groups) == 1:
-            legacy_r2 = output_dir / "action_probe_r2_heatmap.png"
-            legacy_mse = output_dir / "action_probe_mse_heatmap.png"
-            plot_heatmap(
-                r2_pivot.to_numpy(),
-                r2_pivot.index.tolist(),
-                [f"a{int(col)}" for col in r2_pivot.columns.tolist()],
-                "Held-Out Action Probe R^2",
-                "R^2",
-                legacy_r2,
-            )
-            plot_heatmap(
-                mse_pivot.to_numpy(),
-                mse_pivot.index.tolist(),
-                [f"a{int(col)}" for col in mse_pivot.columns.tolist()],
-                "Held-Out Action Probe MSE",
-                "MSE",
-                legacy_mse,
-            )
-            written.extend([legacy_r2.name, legacy_mse.name])
-    return written
+            if args.probe_model in {"ridge", "both"}:
+                start_time = time.time()
+                prediction = fit_ridge_torch(
+                    x_train=x_train,
+                    x_test=x_test,
+                    y_train=y_train,
+                    alpha=args.ridge_alpha,
+                    device=device,
+                )
+                rows.extend(
+                    score_predictions(
+                        probe_model="ridge",
+                        feature_name=feature_name,
+                        target_name=target_name,
+                        split_mode=args.probe_split,
+                        y_test=y_test,
+                        prediction=prediction,
+                        n_train=len(split.train_rows),
+                        n_test=len(split.test_rows),
+                        n_val=len(split.val_rows),
+                        train_seconds=time.time() - start_time,
+                        epochs=None,
+                    )
+                )
+
+            if args.probe_model in {"mlp", "both"}:
+                prediction, epochs, val_loss, train_seconds = fit_mlp_torch(
+                    x_train=x_train,
+                    x_test=x_test,
+                    x_val=x_val,
+                    y_train=y_train,
+                    y_test=y_test,
+                    y_val=y_val,
+                    hidden_dims=args.probe_mlp_hidden_dims,
+                    alpha=args.probe_mlp_alpha,
+                    max_epochs=args.probe_mlp_max_iter,
+                    batch_size=args.probe_mlp_batch_size,
+                    lr=args.probe_mlp_lr,
+                    early_stopping=args.probe_mlp_early_stopping,
+                    patience=args.probe_mlp_n_iter_no_change,
+                    seed=args.seed,
+                    device=device,
+                )
+                model_rows = score_predictions(
+                    probe_model="mlp",
+                    feature_name=feature_name,
+                    target_name=target_name,
+                    split_mode=args.probe_split,
+                    y_test=y_test,
+                    prediction=prediction,
+                    n_train=len(split.train_rows),
+                    n_test=len(split.test_rows),
+                    n_val=len(split.val_rows),
+                    train_seconds=train_seconds,
+                    epochs=epochs,
+                )
+                for row in model_rows:
+                    row["best_val_mse"] = float(val_loss)
+                rows.extend(model_rows)
+
+    return pd.DataFrame(rows).sort_values(
+        ["probe_model", "feature_set", "target", "action_dim"],
+        ignore_index=True,
+    )
+
+
+def pick_feature_name(info: dict[str, Any], feature_prefix: str, *suffixes: str, required: bool = True) -> str | None:
+    for suffix in suffixes:
+        candidate = f"{feature_prefix}.{suffix}"
+        if candidate in info["features"]:
+            return candidate
+    if required:
+        raise KeyError(f"Missing feature for prefix {feature_prefix!r}; tried suffixes {list(suffixes)}.")
+    return None
+
+
+def value_summary(values: np.ndarray) -> dict[str, Any]:
+    flat = values.reshape(-1).astype(np.float64, copy=False)
+    return {
+        "shape": list(values.shape),
+        "mean": float(np.mean(flat)),
+        "std": float(np.std(flat)),
+        "min": float(np.min(flat)),
+        "median": float(np.median(flat)),
+        "max": float(np.max(flat)),
+    }
+
+
+def best_probe_rows(probe_summary_df: pd.DataFrame) -> list[dict[str, Any]]:
+    rows = []
+    for probe_model, model_df in probe_summary_df.groupby("probe_model", sort=True):
+        best_r2 = model_df.sort_values(["mean_r2", "mean_mse"], ascending=[False, True]).iloc[0]
+        best_mse = model_df.sort_values(["mean_mse", "mean_r2"], ascending=[True, False]).iloc[0]
+        rows.append(
+            {
+                "probe_model": probe_model,
+                "best_mean_r2": {
+                    "feature_set": str(best_r2["feature_set"]),
+                    "target": str(best_r2["target"]),
+                    "value": float(best_r2["mean_r2"]),
+                },
+                "best_mean_mse": {
+                    "feature_set": str(best_mse["feature_set"]),
+                    "target": str(best_mse["target"]),
+                    "value": float(best_mse["mean_mse"]),
+                },
+            }
+        )
+    return rows
 
 
 def main() -> None:
     args = parse_args()
-    rng = np.random.default_rng(args.seed)
-    if args.bucket_kmeans_clusters < 0:
-        raise ValueError("--bucket-kmeans-clusters must be >= 0.")
-    if args.bucket_kmeans_fit_samples < 1:
-        raise ValueError("--bucket-kmeans-fit-samples must be >= 1.")
-    if args.bucket_top_k < 1:
-        raise ValueError("--bucket-top-k must be >= 1.")
-    if args.bucket_progress_bins < 1:
-        raise ValueError("--bucket-progress-bins must be >= 1.")
+    if not 0.0 < args.probe_test_size < 1.0:
+        raise ValueError("--probe-test-size must be in (0, 1).")
+    if not 0.0 < args.probe_val_size < 1.0:
+        raise ValueError("--probe-val-size must be in (0, 1).")
+    if args.probe_test_size + args.probe_val_size >= 1.0:
+        raise ValueError("--probe-test-size + --probe-val-size must be < 1.")
 
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    device = select_device(args.device)
     dataset_root = args.dataset_root.resolve()
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1927,38 +800,24 @@ def main() -> None:
         if export_manifest is None
         else export_manifest.get("source_checkpoint_path") or export_manifest.get("policy_path")
     )
-
     info = load_info(dataset_root)
     dataset = make_dataset(dataset_root)
-
-    def pick_feature_name(*suffixes: str, required: bool = True) -> str | None:
-        for suffix in suffixes:
-            candidate = f"{args.feature_prefix}.{suffix}"
-            if candidate in info["features"]:
-                return candidate
-        if not required:
-            return None
-        raise KeyError(
-            f"Missing feature in dataset metadata for prefix {args.feature_prefix!r}. "
-            f"Tried suffixes: {list(suffixes)}"
-        )
-
-    ids_col = pick_feature_name("codebook_id_latents", "codebook_ids", required=False)
-    continuous_col = pick_feature_name("continuous_vector_latents", "continuous")
-    codebook_vectors_col = pick_feature_name("codebook_vector_latents", "codebook_vectors", required=False)
     valid_col = f"{args.feature_prefix}.valid"
-    action_col = "action"
-
-    required_columns = [continuous_col, valid_col, action_col]
-    for column_name in required_columns:
+    continuous_col = pick_feature_name(info, args.feature_prefix, "continuous_vector_latents", "continuous")
+    codebook_vectors_col = pick_feature_name(
+        info,
+        args.feature_prefix,
+        "codebook_vector_latents",
+        "codebook_vectors",
+        required=False,
+    )
+    ids_col = pick_feature_name(info, args.feature_prefix, "codebook_id_latents", "codebook_ids", required=False)
+    for column_name in [valid_col, "action", continuous_col]:
         if column_name not in info["features"]:
             raise KeyError(f"Missing feature in dataset metadata: {column_name}")
 
     valid_counts = load_valid_counts(dataset, valid_col)
-    plot_valid_distribution(valid_counts, output_dir / "valid_distribution.png")
-
-    all_actions, all_valid, episode_index, frame_index = load_action_context(dataset, action_col, valid_col)
-    tail_counts = infer_episode_tail_counts(all_valid, episode_index)
+    all_actions, all_valid, episode_index = load_action_context(dataset, "action", valid_col)
     action_targets = derive_action_targets(
         all_actions,
         all_valid,
@@ -1968,349 +827,66 @@ def main() -> None:
     )
     future_target_names = [name for name in action_targets if name != "current_action"]
     if len(future_target_names) != 1:
-        raise ValueError(f"Expected exactly one future action target, got {future_target_names}.")
+        raise ValueError(f"Expected exactly one future target, got {future_target_names}.")
     future_target_name = future_target_names[0]
     valid_episode_index = extract_valid_episode_index(all_valid, episode_index)
-    valid_frame_index = extract_valid_scalar_context(frame_index, all_valid, episode_index).astype(np.int64, copy=False)
-    valid_progress_index, valid_episode_lengths = extract_valid_progress_context(all_valid, episode_index)
 
+    feature_sets: dict[str, np.ndarray] = {}
     continuous = load_float_array(dataset, continuous_col, valid_col)
+    if "continuous" in args.probe_feature_sets:
+        feature_sets["continuous"] = flatten_valid_latents(continuous)
+    codebook_vectors = None
+    if "codebook_vectors" in args.probe_feature_sets:
+        if codebook_vectors_col is None:
+            raise ValueError("Requested codebook_vectors, but this export does not contain codebook vector latents.")
+        codebook_vectors = load_float_array(dataset, codebook_vectors_col, valid_col)
+        feature_sets["codebook_vectors"] = flatten_valid_latents(codebook_vectors)
+    ids = None
+    if "ids_onehot" in args.probe_feature_sets:
+        if ids_col is None:
+            raise ValueError("Requested ids_onehot, but this export does not contain codebook ID latents.")
+        ids = load_ids(dataset, ids_col, valid_col)
+        feature_sets["ids_onehot"] = ids
+
     valid_frames = int(continuous.shape[0])
     if valid_episode_index.shape[0] != valid_frames:
-        raise ValueError(
-            "Valid-row episode index alignment failed: action targets and latent arrays disagree on row count."
-        )
-    if valid_frame_index.shape[0] != valid_frames or valid_progress_index.shape[0] != valid_frames:
-        raise ValueError("Valid-row frame/progress alignment failed: context arrays disagree on row count.")
+        raise ValueError("Valid action targets and latent arrays disagree on row count.")
+    for feature_name, values in feature_sets.items():
+        if values.shape[0] != valid_frames:
+            raise ValueError(f"{feature_name} has {values.shape[0]} rows but expected {valid_frames}.")
+    for target_name, values in action_targets.items():
+        if values.shape[0] != valid_frames:
+            raise ValueError(f"{target_name} has {values.shape[0]} rows but expected {valid_frames}.")
 
-    ids = None
-    id_inverse = None
-    id_counts = None
-    unique_id_seqs = None
-    top_id_df = None
-    position_df = None
-    id_usage_per_row = np.ones(valid_frames, dtype=np.int64)
-    if ids_col is not None:
-        ids = load_ids(dataset, ids_col, valid_col)
-        if ids.shape[0] != valid_frames:
-            raise ValueError("Discrete ID latents and continuous latents disagree on the number of valid rows.")
-        unique_id_seqs, id_inverse, id_counts = unique_rows(ids)
-        id_usage_per_row = id_counts[id_inverse]
-
-        unique_sequences, unique_sequence_inverse = np.unique(contiguous_row_view(ids), return_index=True)
-        representative_ids = ids[unique_sequence_inverse]
-        representative_counts = id_counts[np.arange(len(unique_sequences))]
-        id_order = np.argsort(representative_counts)[::-1]
-        top_id_df = pd.DataFrame(
-            {
-                "sequence": [format_sequence(seq) for seq in representative_ids[id_order]],
-                "count": representative_counts[id_order],
-                "fraction": representative_counts[id_order] / ids.shape[0],
-            }
-        )
-        top_id_df.to_csv(output_dir / "codebook_id_sequence_counts.csv", index=False)
-        plot_top_sequences(top_id_df.head(args.top_k_sequences), output_dir / "codebook_id_top_sequences.png")
-
-        position_df = plot_id_position_counts(ids, output_dir / "codebook_id_position_counts.png")
-        position_df.to_csv(output_dir / "codebook_id_position_counts.csv", index=False)
-
-    binned_action_targets, action_bin_counts = quantile_bin_targets(action_targets, args.action_bins)
-    action_mi_df = None
-    action_mi_ranking_df = None
-    if ids is not None and id_inverse is not None:
-        action_mi_df, action_mi_ranking_df = compute_action_mutual_information(ids, id_inverse, binned_action_targets)
-        action_mi_df.to_csv(output_dir / "id_action_mutual_information.csv", index=False)
-        action_mi_ranking_df.to_csv(output_dir / "id_action_mutual_information_ranked.csv", index=False)
-
-        mi_pivot = (
-            action_mi_df.assign(row_label=lambda df: df["target"] + "_a" + df["action_dim"].astype(str))
-            .pivot(index="row_label", columns="feature", values="mi")
-            .sort_index()
-        )
-        nmi_pivot = (
-            action_mi_df.assign(row_label=lambda df: df["target"] + "_a" + df["action_dim"].astype(str))
-            .pivot(index="row_label", columns="feature", values="nmi")
-            .sort_index()
-        )
-        plot_heatmap(
-            mi_pivot.to_numpy(),
-            mi_pivot.index.tolist(),
-            mi_pivot.columns.tolist(),
-            "Mutual Information Between ID Features and Action Targets",
-            "MI",
-            output_dir / "id_action_mutual_information_heatmap.png",
-        )
-        plot_heatmap(
-            nmi_pivot.to_numpy(),
-            nmi_pivot.index.tolist(),
-            nmi_pivot.columns.tolist(),
-            "Normalized Mutual Information Between ID Features and Action Targets",
-            "NMI",
-            output_dir / "id_action_normalized_mutual_information_heatmap.png",
-        )
-
-    continuous_flat = continuous.reshape(continuous.shape[0], -1)
-    codebook_vectors = None
-    codebook_vectors_flat = None
-    if codebook_vectors_col is not None:
-        codebook_vectors = load_float_array(dataset, codebook_vectors_col, valid_col)
-        if codebook_vectors.shape[0] != valid_frames:
-            raise ValueError("Codebook vectors and continuous latents disagree on the number of valid rows.")
-        codebook_vectors_flat = codebook_vectors.reshape(codebook_vectors.shape[0], -1)
-
-    continuous_exact_unique, _, continuous_counts = unique_rows(continuous_flat)
-    continuous_rounded = np.round(continuous_flat, decimals=args.rounded_decimals)
-    continuous_rounded_unique, _, continuous_rounded_counts = unique_rows(continuous_rounded)
-
-    codebook_vectors_exact_unique = None
-    codebook_vectors_counts = None
-    codebook_vectors_rounded = None
-    codebook_vectors_rounded_unique = None
-    codebook_vectors_rounded_counts = None
-    if codebook_vectors_flat is not None:
-        codebook_vectors_exact_unique, _, codebook_vectors_counts = unique_rows(codebook_vectors_flat)
-        codebook_vectors_rounded = np.round(codebook_vectors_flat, decimals=args.rounded_decimals)
-        codebook_vectors_rounded_unique, _, codebook_vectors_rounded_counts = unique_rows(codebook_vectors_rounded)
-
-    plot_value_histogram(continuous, "Continuous Latent Value Distribution", output_dir / "continuous_value_histogram.png")
-    plot_slot_norms(continuous, "Continuous Latent L2 Norms by Slot", output_dir / "continuous_slot_norms.png")
-    if codebook_vectors is not None:
-        plot_value_histogram(
-            codebook_vectors,
-            "Codebook Vector Value Distribution",
-            output_dir / "codebook_vectors_value_histogram.png",
-        )
-        plot_slot_norms(
-            codebook_vectors,
-            "Codebook Vector L2 Norms by Slot",
-            output_dir / "codebook_vectors_slot_norms.png",
-        )
-
-    continuous_norms_df = summarize_norms(continuous)
-    continuous_norms_df.to_csv(output_dir / "continuous_slot_norm_summary.csv", index=False)
-    codebook_vectors_norms_df = None
-    if codebook_vectors is not None:
-        codebook_vectors_norms_df = summarize_norms(codebook_vectors)
-        codebook_vectors_norms_df.to_csv(output_dir / "codebook_vectors_slot_norm_summary.csv", index=False)
-
-    pca_colorbar_label = "log10(ID sequence usage)" if ids is not None else "constant (discrete IDs unavailable)"
-    continuous_pca_title = (
-        "Continuous Latents PCA Colored by ID Sequence Usage" if ids is not None else "Continuous Latents PCA"
-    )
-
-    make_pca_scatter(
-        continuous_flat,
-        id_usage_per_row,
-        continuous_pca_title,
-        output_dir / "continuous_pca_by_id_sequence_usage.png",
-        output_dir / "continuous_pca_sample.csv",
-        rng,
-        args.pca_fit_points,
-        args.scatter_points,
-        colorbar_label=pca_colorbar_label,
-    )
-    if codebook_vectors_flat is not None:
-        make_pca_scatter(
-            codebook_vectors_flat,
-            id_usage_per_row,
-            "Codebook Vectors PCA Colored by ID Sequence Usage" if ids is not None else "Codebook Vectors PCA",
-            output_dir / "codebook_vectors_pca_by_id_sequence_usage.png",
-            output_dir / "codebook_vectors_pca_sample.csv",
-            rng,
-            args.pca_fit_points,
-            args.scatter_points,
-            colorbar_label=pca_colorbar_label,
-        )
-
-    bucket_specs = []
-    if ids is not None and id_inverse is not None:
-        bucket_specs.append(make_discrete_bucket_spec(ids, id_inverse))
-    if args.bucket_kmeans_clusters > 0:
-        bucket_specs.append(
-            make_continuous_bucket_spec(
-                continuous_flat,
-                n_clusters=args.bucket_kmeans_clusters,
-                fit_samples=args.bucket_kmeans_fit_samples,
-                seed=args.seed,
-            )
-        )
-    action_bucket_specs = []
-    if args.action_bucket_kmeans_clusters > 0:
-        for target_name, target_values in action_targets.items():
-            action_bucket_specs.append(
-                make_action_kmeans_bucket_spec(
-                    target_values,
-                    target_name=target_name,
-                    n_clusters=args.action_bucket_kmeans_clusters,
-                    fit_samples=args.action_bucket_kmeans_fit_samples,
-                    seed=args.seed,
-                )
-            )
-
-    if bucket_specs:
-        action_bucket_summary_df, action_bucket_summary = run_action_bucket_analysis(
-            bucket_specs=bucket_specs,
-            action_targets=action_targets,
-            output_dir=output_dir,
-            top_k=args.bucket_top_k,
-        )
-        bucket_context_summary_df, bucket_context_summary = run_bucket_context_analysis(
-            bucket_specs=bucket_specs,
-            valid_episode_index=valid_episode_index,
-            valid_frame_index=valid_frame_index,
-            valid_progress_index=valid_progress_index,
-            valid_episode_lengths=valid_episode_lengths,
-            progress_bins=args.bucket_progress_bins,
-            output_dir=output_dir,
-            top_k=args.bucket_top_k,
-        )
-        if action_bucket_specs:
-            action_to_latent_summary_df, action_to_latent_summary = run_action_to_latent_analysis(
-                action_bucket_specs=action_bucket_specs,
-                latent_bucket_specs=bucket_specs,
-                output_dir=output_dir,
-                top_k=args.bucket_top_k,
-            )
-        else:
-            action_to_latent_summary_df = pd.DataFrame(
-                columns=[
-                    "action_target",
-                    "action_bucket_kind",
-                    "action_total_buckets",
-                    "action_active_buckets",
-                    "latent_feature_set",
-                    "latent_bucket_kind",
-                    "latent_total_buckets",
-                    "latent_active_buckets",
-                    "action_latent_nmi",
-                    "latent_given_action_entropy",
-                    "action_given_latent_entropy",
-                    "weighted_mean_active_latent_buckets",
-                    "weighted_mean_top_latent_fraction",
-                    "weighted_mean_latent_entropy",
-                    "weighted_mean_latent_perplexity",
-                    "weighted_mean_latent_buckets_for_80pct_mass",
-                ]
-            )
-            action_to_latent_summary = {}
-            action_to_latent_summary_df.to_csv(output_dir / "action_to_latent_summary.csv", index=False)
-    else:
-        action_bucket_summary_df = pd.DataFrame(
-            columns=[
-                "feature_set",
-                "bucket_kind",
-                "target",
-                "total_buckets",
-                "active_buckets",
-                "singleton_buckets",
-                "max_bucket_usage",
-                "max_bucket_fraction",
-                "mean_variance_explained",
-                "mean_within_bucket_std",
-            ]
-        )
-        action_bucket_summary = {}
-        action_bucket_summary_df.to_csv(output_dir / "action_bucket_summary.csv", index=False)
-        bucket_context_summary_df = pd.DataFrame(
-            columns=[
-                "feature_set",
-                "bucket_kind",
-                "total_buckets",
-                "active_buckets",
-                "bucket_episode_nmi",
-                "weighted_mean_episode_coverage",
-                "weighted_mean_max_episode_fraction",
-                "weighted_mean_episode_perplexity",
-                "weighted_mean_run_length",
-                "weighted_max_run_length",
-                "weighted_adjacent_repeat_fraction",
-                "weighted_progress_bin_coverage",
-            ]
-        )
-        bucket_context_summary = {}
-        bucket_context_summary_df.to_csv(output_dir / "bucket_context_summary.csv", index=False)
-        action_to_latent_summary_df = pd.DataFrame(
-            columns=[
-                "action_target",
-                "action_bucket_kind",
-                "action_total_buckets",
-                "action_active_buckets",
-                "latent_feature_set",
-                "latent_bucket_kind",
-                "latent_total_buckets",
-                "latent_active_buckets",
-                "action_latent_nmi",
-                "latent_given_action_entropy",
-                "action_given_latent_entropy",
-                "weighted_mean_active_latent_buckets",
-                "weighted_mean_top_latent_fraction",
-                "weighted_mean_latent_entropy",
-                "weighted_mean_latent_perplexity",
-                "weighted_mean_latent_buckets_for_80pct_mass",
-            ]
-        )
-        action_to_latent_summary = {}
-        action_to_latent_summary_df.to_csv(output_dir / "action_to_latent_summary.csv", index=False)
-
-    probe_df = run_action_probes(
-        ids=ids,
-        codebook_vectors_flat=codebook_vectors_flat,
-        continuous_flat=continuous_flat,
+    split = make_probe_split(
         valid_episode_index=valid_episode_index,
-        targets=action_targets,
         max_samples=args.probe_max_samples,
         test_size=args.probe_test_size,
-        probe_model=args.probe_model,
-        split_mode=args.probe_split,
-        ridge_alpha=args.ridge_alpha,
-        mlp_hidden_layer_sizes=args.probe_mlp_hidden_dims,
-        mlp_alpha=args.probe_mlp_alpha,
-        mlp_max_iter=args.probe_mlp_max_iter,
-        mlp_early_stopping=args.probe_mlp_early_stopping,
-        mlp_n_iter_no_change=args.probe_mlp_n_iter_no_change,
-        enabled_feature_sets=args.probe_feature_sets,
+        val_size=args.probe_val_size,
         seed=args.seed,
+        mode=args.probe_split,
     )
+    probe_df = run_probes(feature_sets=feature_sets, targets=action_targets, split=split, args=args, device=device)
+    probe_summary_df = summarize_probe_scores(probe_df)
     probe_df.to_csv(output_dir / "action_probe_scores.csv", index=False)
     probe_df.to_csv(output_dir / "action_probe_r2.csv", index=False)
-
-    probe_summary_df = summarize_probe_scores(probe_df)
     probe_summary_df.to_csv(output_dir / "action_probe_scores_summary.csv", index=False)
     probe_summary_df.to_csv(output_dir / "action_probe_r2_summary.csv", index=False)
-    probe_heatmap_artifacts = plot_probe_heatmaps(probe_df, output_dir)
+    best_by_probe_model = best_probe_rows(probe_summary_df)
 
-    best_by_probe_model = []
-    for probe_model, model_df in probe_summary_df.groupby("probe_model", sort=True):
-        best_r2_row = model_df.sort_values(["mean_r2", "mean_mse"], ascending=[False, True]).iloc[0]
-        best_mse_row = model_df.sort_values(["mean_mse", "mean_r2"], ascending=[True, False]).iloc[0]
-        best_by_probe_model.append(
-            {
-                "probe_model": probe_model,
-                "split_mode": str(best_r2_row["split_mode"]),
-                "best_mean_r2": {
-                    "feature_set": str(best_r2_row["feature_set"]),
-                    "target": str(best_r2_row["target"]),
-                    "value": float(best_r2_row["mean_r2"]),
-                },
-                "best_mean_mse": {
-                    "feature_set": str(best_mse_row["feature_set"]),
-                    "target": str(best_mse_row["target"]),
-                    "value": float(best_mse_row["mean_mse"]),
-                },
-            }
-        )
-
+    target_config = validate_future_target_config(
+        default_future_target_config(int(all_actions.shape[1])) if args.future_target_config is None else args.future_target_config,
+        action_dim=int(all_actions.shape[1]),
+    )
+    tail_counts = infer_episode_tail_counts(all_valid, episode_index)
     summary = {
         "dataset_root": str(dataset_root),
         "feature_prefix": args.feature_prefix,
+        "analysis_kind": "latent_action_probes",
         "future_frames": args.future_frames,
         "future_target_name": future_target_name,
-        "future_target_config": validate_future_target_config(
-            default_future_target_config(int(all_actions.shape[1]))
-            if args.future_target_config is None
-            else args.future_target_config,
-            action_dim=int(all_actions.shape[1]),
-        ),
+        "future_target_config": target_config,
+        "device": str(device),
         "total_frames": int(sum(valid_counts.values())),
         "valid_counts": valid_counts,
         "valid_frames": valid_frames,
@@ -2321,235 +897,88 @@ def main() -> None:
             "max": int(np.max(tail_counts)),
             "unique_values": sorted({int(v) for v in tail_counts}),
         },
-        "id_sequences": None
-        if ids is None or id_counts is None or unique_id_seqs is None
-        else {
-            "sequence_length": int(ids.shape[1]),
-            "unique_sequences": unique_id_seqs,
-            "singleton_sequences": int(np.sum(id_counts == 1)),
-            "max_sequence_usage": int(np.max(id_counts)),
-            "mean_sequence_usage": float(np.mean(id_counts)),
-            "median_sequence_usage": float(np.median(id_counts)),
+        "features": {
+            "requested": sorted(args.probe_feature_sets),
+            "available": {
+                "continuous": continuous_col is not None,
+                "codebook_vectors": codebook_vectors_col is not None,
+                "ids_onehot": ids_col is not None,
+            },
+            "continuous": value_summary(continuous),
+            "codebook_vectors": None if codebook_vectors is None else value_summary(codebook_vectors),
+            "ids": None if ids is None else {"shape": list(ids.shape), "unique_rows": int(np.unique(ids, axis=0).shape[0])},
         },
-        "continuous": {
-            "shape_per_frame": list(continuous.shape[1:]),
-            "flattened_dim": int(continuous_flat.shape[1]),
-            "value_summary": summarize_numeric(continuous),
-            "exact_unique_rows": continuous_exact_unique,
-            "exact_singleton_rows": int(np.sum(continuous_counts == 1)),
-            "exact_max_usage": int(np.max(continuous_counts)),
-            "rounded_decimals": args.rounded_decimals,
-            "rounded_unique_rows": continuous_rounded_unique,
-            "rounded_singleton_rows": int(np.sum(continuous_rounded_counts == 1)),
-            "rounded_max_usage": int(np.max(continuous_rounded_counts)),
-        },
-        "codebook_vectors": None
-        if (
-            codebook_vectors is None
-            or codebook_vectors_flat is None
-            or codebook_vectors_exact_unique is None
-            or codebook_vectors_counts is None
-            or codebook_vectors_rounded_unique is None
-            or codebook_vectors_rounded_counts is None
-        )
-        else {
-            "shape_per_frame": list(codebook_vectors.shape[1:]),
-            "flattened_dim": int(codebook_vectors_flat.shape[1]),
-            "value_summary": summarize_numeric(codebook_vectors),
-            "exact_unique_rows": codebook_vectors_exact_unique,
-            "exact_singleton_rows": int(np.sum(codebook_vectors_counts == 1)),
-            "exact_max_usage": int(np.max(codebook_vectors_counts)),
-            "rounded_decimals": args.rounded_decimals,
-            "rounded_unique_rows": codebook_vectors_rounded_unique,
-            "rounded_singleton_rows": int(np.sum(codebook_vectors_rounded_counts == 1)),
-            "rounded_max_usage": int(np.max(codebook_vectors_rounded_counts)),
-        },
-        "action_targets": {
-            target_name: {
-                "shape": list(values.shape),
-                "value_summary": summarize_numeric(values),
-                "binned_dimensions": action_bin_counts[target_name],
-            }
-            for target_name, values in action_targets.items()
-        },
-        "action_mutual_information": None
-        if action_mi_ranking_df is None
-        else {
-            "top_rows": action_mi_ranking_df.head(10).to_dict(orient="records"),
+        "split": {
+            "mode": args.probe_split,
+            "test_size": args.probe_test_size,
+            "val_size": args.probe_val_size,
+            "max_samples": args.probe_max_samples,
+            "n_train": int(split.train_rows.shape[0]),
+            "n_val": int(split.val_rows.shape[0]),
+            "n_test": int(split.test_rows.shape[0]),
         },
         "action_probes": {
             "probe_model": args.probe_model,
-            "split_mode": args.probe_split,
+            "probe_feature_sets": sorted(args.probe_feature_sets),
+            "ridge_alpha": args.ridge_alpha,
+            "mlp": {
+                "hidden_dims": list(args.probe_mlp_hidden_dims),
+                "alpha": args.probe_mlp_alpha,
+                "max_epochs": args.probe_mlp_max_iter,
+                "batch_size": args.probe_mlp_batch_size,
+                "learning_rate": args.probe_mlp_lr,
+                "early_stopping": args.probe_mlp_early_stopping,
+                "patience": args.probe_mlp_n_iter_no_change,
+            },
             "mean_scores_by_feature_and_target": probe_summary_df.to_dict(orient="records"),
             "best_by_probe_model": best_by_probe_model,
-        },
-        "action_buckets": {
-            "summary_rows": action_bucket_summary_df.to_dict(orient="records"),
-            "by_feature_set": action_bucket_summary,
-        },
-        "bucket_context": {
-            "summary_rows": bucket_context_summary_df.to_dict(orient="records"),
-            "by_feature_set": bucket_context_summary,
-        },
-        "action_to_latent": {
-            "summary_rows": action_to_latent_summary_df.to_dict(orient="records"),
-            "by_action_target": action_to_latent_summary,
         },
         "artifacts": sorted(p.name for p in output_dir.iterdir()),
     }
     save_json(output_dir / "summary.json", summary)
 
-    summary_lines = [
-        "# Latent Feature Distribution Analysis",
+    readme_lines = [
+        "# Latent Action Probe Analysis",
         "",
         f"- Dataset root: `{dataset_root}`",
         f"- Feature prefix: `{args.feature_prefix}`",
-        f"- Future frames used for action summaries: `{args.future_frames}`",
-        f"- Future target name: `{future_target_name}`",
-        f"- Total frames: `{summary['total_frames']}`",
-        f"- Valid frames: `{summary['valid_frames']}`",
-        f"- Invalid frames: `{summary['invalid_frames']}`",
+        f"- Future frames: `{args.future_frames}`",
+        f"- Future target: `{future_target_name}`",
+        f"- Device: `{device}`",
+        f"- Valid frames: `{valid_frames}`",
+        f"- Split: `{args.probe_split}`, train `{len(split.train_rows)}`, val `{len(split.val_rows)}`, test `{len(split.test_rows)}`",
+        f"- Feature sets: `{', '.join(sorted(args.probe_feature_sets))}`",
         "",
-        "## ID Sequences",
+        "## Best Probe Scores",
     ]
-    if summary["id_sequences"] is not None:
-        summary_lines.extend(
-            [
-                f"- Unique sequences: `{summary['id_sequences']['unique_sequences']}`",
-                f"- Singleton sequences: `{summary['id_sequences']['singleton_sequences']}`",
-                f"- Max sequence usage: `{summary['id_sequences']['max_sequence_usage']}`",
-                f"- Median sequence usage: `{summary['id_sequences']['median_sequence_usage']:.2f}`",
-            ]
-        )
-    else:
-        summary_lines.append("- Unavailable for this dataset because no discrete codebook ID latents were exported.")
-    summary_lines.extend(
-        [
-            "",
-            "## Continuous",
-            f"- Exact unique rows: `{summary['continuous']['exact_unique_rows']}`",
-            f"- Rounded unique rows ({args.rounded_decimals} decimals): `{summary['continuous']['rounded_unique_rows']}`",
-            f"- Exact max usage: `{summary['continuous']['exact_max_usage']}`",
-            "",
-            "## Codebook Vectors",
-        ]
-    )
-    if summary["codebook_vectors"] is not None:
-        summary_lines.extend(
-            [
-                f"- Exact unique rows: `{summary['codebook_vectors']['exact_unique_rows']}`",
-                f"- Rounded unique rows ({args.rounded_decimals} decimals): `{summary['codebook_vectors']['rounded_unique_rows']}`",
-                f"- Exact max usage: `{summary['codebook_vectors']['exact_max_usage']}`",
-            ]
-        )
-    else:
-        summary_lines.append("- Unavailable for this dataset because no codebook vector latents were exported.")
-    summary_lines.extend(
-        [
-            "",
-            "## Action Mutual Information",
-        ]
-    )
-    if action_mi_ranking_df is not None:
-        top_mi_row = action_mi_ranking_df.iloc[0]
-        summary_lines.append(
-            f"- Top MI pair: `{top_mi_row['feature']}` vs `{top_mi_row['target']}` dim `{int(top_mi_row['action_dim'])}` with MI `{top_mi_row['mi']:.4f}` and NMI `{top_mi_row['nmi']:.4f}`"
-        )
-    else:
-        summary_lines.append("- Unavailable for this dataset because no discrete ID latents were exported.")
-    summary_lines.extend(
-        [
-            "",
-            "## Action Probes",
-            f"- Probe split mode: `{args.probe_split}`",
-            f"- Probe backends requested: `{args.probe_model}`",
-        ]
-    )
     for best in best_by_probe_model:
-        summary_lines.extend(
-            [
-                f"- Best mean held-out R^2 ({best['probe_model']}): `{best['best_mean_r2']['feature_set']}` -> `{best['best_mean_r2']['target']}` = `{best['best_mean_r2']['value']:.4f}`",
-                f"- Best mean held-out MSE ({best['probe_model']}): `{best['best_mean_mse']['feature_set']}` -> `{best['best_mean_mse']['target']}` = `{best['best_mean_mse']['value']:.6f}`",
-            ]
+        readme_lines.append(
+            f"- `{best['probe_model']}` best R^2: `{best['best_mean_r2']['feature_set']}` -> "
+            f"`{best['best_mean_r2']['target']}` = `{best['best_mean_r2']['value']:.4f}`"
         )
-    summary_lines.extend(["", "## Action Buckets"])
-    if action_bucket_summary_df.shape[0] > 0:
-        for row in action_bucket_summary_df.head(args.bucket_top_k).to_dict(orient="records"):
-            summary_lines.append(
-                f"- `{row['feature_set']}` -> `{row['target']}`: mean variance explained `{row['mean_variance_explained']:.4f}` across `{int(row['active_buckets'])}` active buckets"
-            )
-    else:
-        summary_lines.append("- No action bucket analysis was run.")
-    summary_lines.extend(["", "## Bucket Context"])
-    if bucket_context_summary_df.shape[0] > 0:
-        for row in bucket_context_summary_df.to_dict(orient="records"):
-            summary_lines.append(
-                f"- `{row['feature_set']}`: episode NMI `{row['bucket_episode_nmi']:.4f}`, weighted episode coverage `{row['weighted_mean_episode_coverage']:.4f}`, weighted max-episode fraction `{row['weighted_mean_max_episode_fraction']:.4f}`, weighted adjacent-repeat fraction `{row['weighted_adjacent_repeat_fraction']:.4f}`"
-            )
-    else:
-        summary_lines.append("- No bucket context analysis was run.")
-    summary_lines.extend(["", "## Action-to-Latent Consistency"])
-    if action_to_latent_summary_df.shape[0] > 0:
-        for row in action_to_latent_summary_df.to_dict(orient="records"):
-            summary_lines.append(
-                f"- `{row['action_target']}` -> `{row['latent_feature_set']}`: top-latent fraction `{row['weighted_mean_top_latent_fraction']:.4f}`, latent perplexity `{row['weighted_mean_latent_perplexity']:.4f}`, H(latent|action) `{row['latent_given_action_entropy']:.4f}`, NMI `{row['action_latent_nmi']:.4f}`"
-            )
-    else:
-        summary_lines.append("- No action-to-latent consistency analysis was run.")
-    summary_lines.extend(
-        [
-            "",
-            "## Scatter Plot Coloring",
-            "- PCA plots are colored by `log10(ID sequence usage)` for the corresponding frame."
-            if ids is not None
-            else "- PCA plots use a constant color scale because discrete ID sequence usage is unavailable.",
-            "",
-            "## Probe Heatmaps",
-        ]
-    )
-    summary_lines.extend(f"- `{artifact}`" for artifact in sorted(probe_heatmap_artifacts))
+        readme_lines.append(
+            f"- `{best['probe_model']}` best MSE: `{best['best_mean_mse']['feature_set']}` -> "
+            f"`{best['best_mean_mse']['target']}` = `{best['best_mean_mse']['value']:.6f}`"
+        )
     readme_path = output_dir / "README.md"
-    readme_path.write_text("\n".join(summary_lines) + "\n")
+    readme_path.write_text("\n".join(readme_lines) + "\n")
 
-    def probe_metric(feature_set: str, target: str, metric: str) -> float | None:
+    def probe_metric(feature_set: str, target: str, metric: str, model: str) -> float | None:
         rows = probe_summary_df[
-            (probe_summary_df["feature_set"] == feature_set) & (probe_summary_df["target"] == target)
+            (probe_summary_df["probe_model"] == model)
+            & (probe_summary_df["feature_set"] == feature_set)
+            & (probe_summary_df["target"] == target)
         ]
-        if rows.shape[0] == 0:
-            return None
-        return float(rows.iloc[0][metric])
-
-    def bucket_metric(feature_set: str, target: str, metric: str) -> float | None:
-        rows = action_bucket_summary_df[
-            (action_bucket_summary_df["feature_set"] == feature_set) & (action_bucket_summary_df["target"] == target)
-        ]
-        if rows.shape[0] == 0:
-            return None
-        return float(rows.iloc[0][metric])
-
-    def context_metric(feature_set: str, metric: str) -> float | None:
-        rows = bucket_context_summary_df[bucket_context_summary_df["feature_set"] == feature_set]
-        if rows.shape[0] == 0:
-            return None
-        return float(rows.iloc[0][metric])
-
-    def action_to_latent_metric(action_target: str, latent_feature_set: str, metric: str) -> float | None:
-        rows = action_to_latent_summary_df[
-            (action_to_latent_summary_df["action_target"] == action_target)
-            & (action_to_latent_summary_df["latent_feature_set"] == latent_feature_set)
-        ]
-        if rows.shape[0] == 0:
-            return None
-        return float(rows.iloc[0][metric])
+        return None if rows.shape[0] == 0 else float(rows.iloc[0][metric])
 
     analysis_manifest = {
         "artifact_type": "latent_analysis",
-        "analysis_kind": "latent_core",
-        "suite_name": "latent_core",
-        "suite_version": "v2",
+        "analysis_kind": "latent_action_probes",
+        "suite_name": "latent_action_probes",
+        "suite_version": "gpu_v1",
         "artifact_id": make_artifact_id(
-            suite_name="latent_core",
-            suite_version="v2",
+            suite_name="latent_action_probes",
+            suite_version="gpu_v1",
             checkpoint_id=checkpoint_meta["source_checkpoint_id"],
             output_label=output_dir.name,
         ),
@@ -2567,93 +996,18 @@ def main() -> None:
         "headline_metrics": {
             "probe_split": args.probe_split,
             "probe_model": args.probe_model,
+            "probe_feature_sets": sorted(args.probe_feature_sets),
             "future_target_name": future_target_name,
-            "continuous_current_mean_r2": probe_metric("continuous", "current_action", "mean_r2"),
-            "continuous_current_mean_mse": probe_metric("continuous", "current_action", "mean_mse"),
-            "continuous_future_mean_r2": probe_metric("continuous", "future_action_mean", "mean_r2"),
-            "continuous_future_mean_mse": probe_metric("continuous", "future_action_mean", "mean_mse"),
-            "continuous_future_target_mean_r2": probe_metric("continuous", future_target_name, "mean_r2"),
-            "continuous_future_target_mean_mse": probe_metric("continuous", future_target_name, "mean_mse"),
-            "id_sequence_current_mean_r2": probe_metric("id_sequence", "current_action", "mean_r2"),
-            "id_sequence_current_mean_mse": probe_metric("id_sequence", "current_action", "mean_mse"),
-            "id_sequence_future_mean_r2": probe_metric("id_sequence", "future_action_mean", "mean_r2"),
-            "id_sequence_future_mean_mse": probe_metric("id_sequence", "future_action_mean", "mean_mse"),
-            "id_sequence_future_target_mean_r2": probe_metric("id_sequence", future_target_name, "mean_r2"),
-            "id_sequence_future_target_mean_mse": probe_metric("id_sequence", future_target_name, "mean_mse"),
-            "continuous_kmeans_current_mean_variance_explained": bucket_metric(
-                "continuous_kmeans", "current_action", "mean_variance_explained"
-            ),
-            "continuous_kmeans_future_mean_variance_explained": bucket_metric(
-                "continuous_kmeans", "future_action_mean", "mean_variance_explained"
-            ),
-            "continuous_kmeans_future_target_mean_variance_explained": bucket_metric(
-                "continuous_kmeans", future_target_name, "mean_variance_explained"
-            ),
-            "id_sequence_current_mean_variance_explained": bucket_metric(
-                "id_sequence", "current_action", "mean_variance_explained"
-            ),
-            "id_sequence_future_mean_variance_explained": bucket_metric(
-                "id_sequence", "future_action_mean", "mean_variance_explained"
-            ),
-            "id_sequence_future_target_mean_variance_explained": bucket_metric(
-                "id_sequence", future_target_name, "mean_variance_explained"
-            ),
-            "continuous_kmeans_bucket_episode_nmi": context_metric("continuous_kmeans", "bucket_episode_nmi"),
-            "continuous_kmeans_weighted_episode_coverage": context_metric(
-                "continuous_kmeans", "weighted_mean_episode_coverage"
-            ),
-            "id_sequence_bucket_episode_nmi": context_metric("id_sequence", "bucket_episode_nmi"),
-            "id_sequence_weighted_episode_coverage": context_metric(
-                "id_sequence", "weighted_mean_episode_coverage"
-            ),
-            "future_action_to_id_sequence_top_latent_fraction": action_to_latent_metric(
-                "future_action_mean", "id_sequence", "weighted_mean_top_latent_fraction"
-            ),
-            "future_action_to_id_sequence_latent_given_action_entropy": action_to_latent_metric(
-                "future_action_mean", "id_sequence", "latent_given_action_entropy"
-            ),
-            "future_action_to_id_sequence_nmi": action_to_latent_metric(
-                "future_action_mean", "id_sequence", "action_latent_nmi"
-            ),
-            "future_action_to_continuous_kmeans_top_latent_fraction": action_to_latent_metric(
-                "future_action_mean", "continuous_kmeans", "weighted_mean_top_latent_fraction"
-            ),
-            "future_action_to_continuous_kmeans_latent_given_action_entropy": action_to_latent_metric(
-                "future_action_mean", "continuous_kmeans", "latent_given_action_entropy"
-            ),
-            "future_action_to_continuous_kmeans_nmi": action_to_latent_metric(
-                "future_action_mean", "continuous_kmeans", "action_latent_nmi"
-            ),
-            "future_target_to_id_sequence_top_latent_fraction": action_to_latent_metric(
-                future_target_name, "id_sequence", "weighted_mean_top_latent_fraction"
-            ),
-            "future_target_to_id_sequence_latent_given_action_entropy": action_to_latent_metric(
-                future_target_name, "id_sequence", "latent_given_action_entropy"
-            ),
-            "future_target_to_id_sequence_nmi": action_to_latent_metric(
-                future_target_name, "id_sequence", "action_latent_nmi"
-            ),
-            "future_target_to_continuous_kmeans_top_latent_fraction": action_to_latent_metric(
-                future_target_name, "continuous_kmeans", "weighted_mean_top_latent_fraction"
-            ),
-            "future_target_to_continuous_kmeans_latent_given_action_entropy": action_to_latent_metric(
-                future_target_name, "continuous_kmeans", "latent_given_action_entropy"
-            ),
-            "future_target_to_continuous_kmeans_nmi": action_to_latent_metric(
-                future_target_name, "continuous_kmeans", "action_latent_nmi"
-            ),
-            "top_mi": None if action_mi_ranking_df is None or action_mi_ranking_df.shape[0] == 0 else float(action_mi_ranking_df.iloc[0]["mi"]),
-            "top_nmi": None if action_mi_ranking_df is None or action_mi_ranking_df.shape[0] == 0 else float(action_mi_ranking_df.iloc[0]["nmi"]),
+            "continuous_current_ridge_mean_r2": probe_metric("continuous", "current_action", "mean_r2", "ridge"),
+            "continuous_current_mlp_mean_r2": probe_metric("continuous", "current_action", "mean_r2", "mlp"),
+            "continuous_future_ridge_mean_r2": probe_metric("continuous", future_target_name, "mean_r2", "ridge"),
+            "continuous_future_mlp_mean_r2": probe_metric("continuous", future_target_name, "mean_r2", "mlp"),
         },
     }
     register_artifact(
         manifest_path=output_dir / "analysis_manifest.json",
         manifest=analysis_manifest,
-        registry_candidates=[
-            output_dir,
-            dataset_root,
-            checkpoint_meta["source_checkpoint_path"],
-        ],
+        registry_candidates=[output_dir, dataset_root, checkpoint_meta["source_checkpoint_path"]],
     )
 
 
