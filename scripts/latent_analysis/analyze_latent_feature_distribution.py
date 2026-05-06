@@ -27,6 +27,9 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+SCRIPTS_DIR = SCRIPT_DIR.parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 from _artifact_registry import infer_checkpoint_metadata, load_export_manifest, make_artifact_id, register_artifact
 
@@ -57,6 +60,21 @@ def parse_future_target_config(raw: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise argparse.ArgumentTypeError("--future-target-config must decode to a JSON object.")
     return payload
+
+
+def parse_probe_feature_sets(raw: str) -> set[str] | None:
+    values = {part.strip() for part in raw.split(",") if part.strip()}
+    if not values:
+        raise argparse.ArgumentTypeError("--probe-feature-sets must not be empty.")
+    if values == {"all"}:
+        return None
+    if "all" in values:
+        raise argparse.ArgumentTypeError("--probe-feature-sets cannot combine 'all' with explicit feature sets.")
+    allowed = {"ids_onehot", "codebook_vectors", "continuous"}
+    unknown = values.difference(allowed)
+    if unknown:
+        raise argparse.ArgumentTypeError(f"Unknown --probe-feature-sets entries: {sorted(unknown)}")
+    return values
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,6 +144,15 @@ def parse_args() -> argparse.Namespace:
         choices=("ridge", "mlp", "both"),
         default="ridge",
         help="Probe backend used for action prediction.",
+    )
+    parser.add_argument(
+        "--probe-feature-sets",
+        type=parse_probe_feature_sets,
+        default=None,
+        help=(
+            "Comma-separated probe feature sets to evaluate. Supported values: "
+            "all, ids_onehot, codebook_vectors, continuous."
+        ),
     )
     parser.add_argument(
         "--probe-split",
@@ -1508,13 +1535,16 @@ def build_probe_feature_sets(
     ids: np.ndarray | None,
     codebook_vectors_flat: np.ndarray | None,
     continuous_flat: np.ndarray | None,
+    enabled_feature_sets: set[str] | None = None,
 ) -> dict[str, np.ndarray]:
+    if enabled_feature_sets is None:
+        enabled_feature_sets = {"ids_onehot", "codebook_vectors", "continuous"}
     feature_sets = {}
-    if ids is not None:
+    if ids is not None and "ids_onehot" in enabled_feature_sets:
         feature_sets["ids_onehot"] = ids
-    if codebook_vectors_flat is not None:
+    if codebook_vectors_flat is not None and "codebook_vectors" in enabled_feature_sets:
         feature_sets["codebook_vectors"] = codebook_vectors_flat
-    if continuous_flat is not None:
+    if continuous_flat is not None and "continuous" in enabled_feature_sets:
         feature_sets["continuous"] = continuous_flat
     if not feature_sets:
         raise ValueError("At least one feature set is required for action probes.")
@@ -1759,6 +1789,7 @@ def run_action_probes(
     mlp_max_iter: int,
     mlp_early_stopping: bool,
     mlp_n_iter_no_change: int,
+    enabled_feature_sets: set[str] | None,
     seed: int,
 ) -> pd.DataFrame:
     train_rows, test_rows = make_probe_split(
@@ -1772,6 +1803,7 @@ def run_action_probes(
         ids=ids,
         codebook_vectors_flat=codebook_vectors_flat,
         continuous_flat=continuous_flat,
+        enabled_feature_sets=enabled_feature_sets,
     )
 
     frames = []
@@ -2236,6 +2268,7 @@ def main() -> None:
         mlp_max_iter=args.probe_mlp_max_iter,
         mlp_early_stopping=args.probe_mlp_early_stopping,
         mlp_n_iter_no_change=args.probe_mlp_n_iter_no_change,
+        enabled_feature_sets=args.probe_feature_sets,
         seed=args.seed,
     )
     probe_df.to_csv(output_dir / "action_probe_scores.csv", index=False)
