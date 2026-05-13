@@ -2,14 +2,14 @@
 
 `lerobot_latent_actions` provides two complementary analysis entrypoints:
 
-- `scripts/analyze_latent_feature_distribution.py`
-- `scripts/analyze_spcfc.py`
+- `scripts/latent_analysis/analyze_latent_feature_distribution.py`
+- `scripts/latent_analysis/analyze_spcfc.py`
 
 Use them for different questions.
 
 ## 1. Labeled-Dataset Analysis
 
-`analyze_latent_feature_distribution.py` operates on an already labeled dataset and a feature prefix such as
+`scripts/latent_analysis/analyze_latent_feature_distribution.py` operates on an already labeled dataset and a feature prefix such as
 `latent_labels`.
 
 It computes:
@@ -23,7 +23,7 @@ It computes:
 Example:
 
 ```bash
-python scripts/analyze_latent_feature_distribution.py \
+python scripts/latent_analysis/analyze_latent_feature_distribution.py \
   --dataset-root=/path/to/labeled_dataset \
   --feature-prefix=latent_labels \
   --output-dir=/path/to/analysis
@@ -126,7 +126,7 @@ Interpretation:
 
 ## 2. Checkpoint-Based S-PCFC Analysis
 
-`analyze_spcfc.py` computes CoMo-style S-PCFC from:
+`scripts/latent_analysis/analyze_spcfc.py` computes CoMo-style S-PCFC from:
 - a latent-action checkpoint
 - the raw dataset
 
@@ -138,7 +138,7 @@ re-encode:
 Example:
 
 ```bash
-python scripts/analyze_spcfc.py \
+python scripts/latent_analysis/analyze_spcfc.py \
   --policy-path=/path/to/checkpoint/pretrained_model \
   --dataset-repo-id=HuggingFaceVLA/libero \
   --dataset-root=/path/to/libero \
@@ -193,8 +193,8 @@ Use `S-PCFC` when:
 ## Reading More
 
 Code:
-- `scripts/analyze_latent_feature_distribution.py`
-- `scripts/analyze_spcfc.py`
+- `scripts/latent_analysis/analyze_latent_feature_distribution.py`
+- `scripts/latent_analysis/analyze_spcfc.py`
 
 Paper context:
 - CoMo defines Action Prediction `MSE` and `S-PCFC` as complementary latent-motion diagnostics

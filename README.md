@@ -17,7 +17,7 @@ Typical workflow:
 
 1. install LeRobot and one or more policy plugins
 2. train or select a latent-action-model checkpoint
-3. label a dataset with `scripts/label_lerobot_dataset.py`
+3. label a dataset with `scripts/labeling/label_lerobot_dataset.py`
 4. train a downstream policy on those latent labels
 
 Detailed guides:
@@ -30,20 +30,20 @@ Detailed guides:
 ## Main Entrypoint
 
 ```bash
-python scripts/label_lerobot_dataset.py --help
+python scripts/labeling/label_lerobot_dataset.py --help
 ```
 
 Optional analysis entrypoints:
 
 ```bash
-python scripts/analyze_latent_feature_distribution.py --help
-python scripts/analyze_spcfc.py --help
+python scripts/latent_analysis/analyze_latent_feature_distribution.py --help
+python scripts/latent_analysis/analyze_spcfc.py --help
 ```
 
 Lightweight export entrypoint for analysis without copying observations:
 
 ```bash
-python scripts/export_latent_analysis_dataset.py --help
+python scripts/labeling/export_latent_analysis_dataset.py --help
 ```
 
 ## Key Design Rules

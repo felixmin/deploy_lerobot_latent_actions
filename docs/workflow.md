@@ -35,7 +35,7 @@ pip install -e /mnt/data/workspace/code/lerobot_policy_latent_smolvla
 
 ## 2. Train Or Select A Latent-Action Checkpoint
 
-`label_lerobot_dataset.py` does not train the latent-action model. It loads an existing checkpoint from `--policy.path`.
+`scripts/labeling/label_lerobot_dataset.py` does not train the latent-action model. It loads an existing checkpoint from `--policy.path`.
 
 Requirements for that checkpoint:
 - it must load through normal LeRobot `PreTrainedConfig.from_pretrained(...)`
@@ -51,7 +51,7 @@ Working example:
 Run:
 
 ```bash
-python scripts/label_lerobot_dataset.py \
+python scripts/labeling/label_lerobot_dataset.py \
   --policy.path=/path/to/checkpoint/pretrained_model \
   --policy.discover_packages_path=your_policy_package \
   --dataset_repo_id=HuggingFaceVLA/libero \
@@ -72,7 +72,7 @@ Important points:
 If you only need action-plus-latent analysis and do not want to copy observations or videos, use:
 
 ```bash
-python scripts/export_latent_analysis_dataset.py \
+python scripts/labeling/export_latent_analysis_dataset.py \
   --policy.path=/path/to/checkpoint/pretrained_model \
   --policy.discover_packages_path=your_policy_package \
   --dataset_repo_id=HuggingFaceVLA/libero \
@@ -108,8 +108,8 @@ If the policy exposes quantized representations, you may also see:
 - `latent_labels.codebook_vector_latents`
 
 Optional analysis scripts:
-- `scripts/analyze_latent_feature_distribution.py` for distribution plots, MI/NMI, and held-out action probes
-- `scripts/analyze_spcfc.py` for CoMo-style S-PCFC computed from a checkpoint plus raw frame pairs
+- `scripts/latent_analysis/analyze_latent_feature_distribution.py` for distribution plots, MI/NMI, and held-out action probes
+- `scripts/latent_analysis/analyze_spcfc.py` for CoMo-style S-PCFC computed from a checkpoint plus raw frame pairs
 
 ## 5. Train A Downstream Policy
 
