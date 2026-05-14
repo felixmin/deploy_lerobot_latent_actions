@@ -25,6 +25,7 @@ import torch
 from scipy.spatial.transform import Rotation
 from sklearn.model_selection import train_test_split
 
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCRIPTS_DIR = SCRIPT_DIR.parent
 for path in (SCRIPT_DIR, SCRIPTS_DIR):
