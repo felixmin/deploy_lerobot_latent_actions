@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import copy
+import inspect
 import json
 import logging
 import shutil
@@ -144,6 +145,33 @@ def _resolve_video_keys_to_load(
     video_keys = set(dataset.meta.video_keys)
     plan_video_keys = [key for key in plan["delta_timestamps"] if key in video_keys]
     return plan_video_keys or None
+
+
+def _lerobot_dataset_accepts_video_keys_to_load() -> bool:
+    parameters = inspect.signature(LeRobotDataset).parameters
+    return "video_keys_to_load" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+
+def _make_lerobot_dataset(
+    repo_id: str,
+    *,
+    root: str | None,
+    video_keys_to_load: list[str] | None = None,
+    **kwargs: Any,
+) -> LeRobotDataset:
+    dataset_kwargs = dict(kwargs)
+    if video_keys_to_load is not None:
+        if _lerobot_dataset_accepts_video_keys_to_load():
+            dataset_kwargs["video_keys_to_load"] = video_keys_to_load
+        else:
+            logging.warning(
+                "Installed LeRobotDataset does not support video_keys_to_load=%s. "
+                "Falling back to the default image/video loading behavior.",
+                video_keys_to_load,
+            )
+    return LeRobotDataset(repo_id, root=root, **dataset_kwargs)
 
 
 def _select_plan_latent_sequence_index(plan: dict[str, Any], index: int | None) -> dict[str, Any]:
@@ -349,7 +377,7 @@ def export_latent_analysis_dataset(cfg: AnalysisLatentExportConfig) -> None:
         dataset=source_dataset,
     )
 
-    label_dataset = LeRobotDataset(
+    label_dataset = _make_lerobot_dataset(
         cfg.dataset_repo_id,
         root=cfg.dataset_root,
         episodes=cfg.episodes,
