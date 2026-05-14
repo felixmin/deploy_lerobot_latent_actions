@@ -27,6 +27,9 @@ from lerobot.utils.utils import init_logging
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+SCRIPTS_DIR = SCRIPT_DIR.parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 from _artifact_registry import infer_checkpoint_metadata, make_artifact_id, register_artifact
 
@@ -40,6 +43,7 @@ class AnalysisLatentExportConfig:
     dataset_repo_id: str | None = None
     dataset_root: str | None = None
     episodes: list[int] | None = None
+    video_keys_to_load: list[str] | None = None
     output_dir: Path | None = None
     output_repo_id: str | None = None
     feature_prefix: str = "latent_labels"
@@ -48,6 +52,7 @@ class AnalysisLatentExportConfig:
     rename_map: dict[str, str] | None = None
     force: bool = False
     max_valid_samples: int | None = None
+    latent_sequence_index: int | None = None
 
     def validate(self) -> None:
         policy_path = parser.get_path_arg("policy")
@@ -128,6 +133,35 @@ def _normalize_export_plan(plan: Any) -> dict[str, Any]:
     }
 
 
+def _resolve_video_keys_to_load(
+    *,
+    requested: list[str] | None,
+    plan: dict[str, Any],
+    dataset: LeRobotDataset,
+) -> list[str] | None:
+    if requested is not None:
+        return requested
+
+    video_keys = set(dataset.meta.video_keys)
+    plan_video_keys = [key for key in plan["delta_timestamps"] if key in video_keys]
+    return plan_video_keys or None
+
+
+def _select_plan_latent_sequence_index(plan: dict[str, Any], index: int | None) -> dict[str, Any]:
+    if index is None:
+        return plan
+    selected = copy.deepcopy(plan)
+    for spec in selected["representations"].values():
+        shape = tuple(spec["shape"])
+        if len(shape) < 2:
+            raise ValueError(
+                f"Cannot apply latent_sequence_index={index} to representation shape {shape}; "
+                "expected at least a sequence axis and feature axis."
+            )
+        spec["shape"] = shape[1:]
+    return selected
+
+
 def _normalize_export_batch(batch_out: Any) -> dict[str, Any]:
     if not isinstance(batch_out, dict):
         raise TypeError(f"export_latent_labels() must return a dict, got {type(batch_out)}.")
@@ -144,6 +178,18 @@ def _normalize_export_batch(batch_out: Any) -> dict[str, Any]:
             labels = torch.as_tensor(labels)
         labels_by_name[name] = labels
     return {"labels_by_name": labels_by_name, "valid_mask": valid_mask}
+
+
+def _select_batch_latent_sequence_index(batch_out: dict[str, Any], index: int | None) -> dict[str, Any]:
+    if index is None:
+        return batch_out
+    return {
+        "valid_mask": batch_out["valid_mask"],
+        "labels_by_name": {
+            name: labels.select(1, index)
+            for name, labels in batch_out["labels_by_name"].items()
+        },
+    }
 
 
 def _to_numpy_column(values: Any) -> np.ndarray:
@@ -296,13 +342,20 @@ def export_latent_analysis_dataset(cfg: AnalysisLatentExportConfig) -> None:
     policy = make_policy(cfg.policy, ds_meta=source_dataset.meta, rename_map=cfg.rename_map)
     prepare_latent_export = _get_required_method(policy, "prepare_latent_export")
     export_latent_labels = _get_required_method(policy, "export_latent_labels")
-    plan = _normalize_export_plan(prepare_latent_export(source_dataset.meta))
+    raw_plan = _normalize_export_plan(prepare_latent_export(source_dataset.meta))
+    plan = _select_plan_latent_sequence_index(raw_plan, cfg.latent_sequence_index)
+    video_keys_to_load = _resolve_video_keys_to_load(
+        requested=cfg.video_keys_to_load,
+        plan=raw_plan,
+        dataset=source_dataset,
+    )
 
     label_dataset = LeRobotDataset(
         cfg.dataset_repo_id,
         root=cfg.dataset_root,
         episodes=cfg.episodes,
         delta_timestamps=plan["delta_timestamps"],
+        video_keys_to_load=video_keys_to_load,
     )
     dataloader = torch.utils.data.DataLoader(
         label_dataset,
@@ -337,7 +390,9 @@ def export_latent_analysis_dataset(cfg: AnalysisLatentExportConfig) -> None:
                 "num_workers": cfg.num_workers,
                 "rename_map": cfg.rename_map,
                 "delta_timestamps": plan["delta_timestamps"],
+                "video_keys_to_load": video_keys_to_load,
                 "max_valid_samples": cfg.max_valid_samples,
+                "latent_sequence_index": cfg.latent_sequence_index,
             }
         ),
     )
@@ -353,7 +408,10 @@ def export_latent_analysis_dataset(cfg: AnalysisLatentExportConfig) -> None:
             if stop_after_episode_index is not None and int(episode_index_batch[0]) > stop_after_episode_index:
                 break
 
-            compact_batch = _normalize_export_batch(export_latent_labels(batch))
+            compact_batch = _select_batch_latent_sequence_index(
+                _normalize_export_batch(export_latent_labels(batch)),
+                cfg.latent_sequence_index,
+            )
             batch_size = int(_to_numpy_column(batch["index"]).shape[0])
             expanded_labels, valid_mask = _expand_compact_labels(
                 compact_batch=compact_batch,
@@ -455,6 +513,8 @@ def export_latent_analysis_dataset(cfg: AnalysisLatentExportConfig) -> None:
         "valid_feature_name": f"{cfg.feature_prefix}.valid",
         "passthrough_feature_names": passthrough_keys,
         "delta_timestamps": plan["delta_timestamps"],
+        "video_keys_to_load": video_keys_to_load,
+        "latent_sequence_index": cfg.latent_sequence_index,
         "num_rows": total_written_rows,
         "num_valid_labels": total_written_valid,
         "data_file": str(data_path),
@@ -490,6 +550,8 @@ def export_latent_analysis_dataset(cfg: AnalysisLatentExportConfig) -> None:
         "valid_feature_name": f"{cfg.feature_prefix}.valid",
         "passthrough_feature_names": passthrough_keys,
         "delta_timestamps": plan["delta_timestamps"],
+        "video_keys_to_load": video_keys_to_load,
+        "latent_sequence_index": cfg.latent_sequence_index,
         "num_rows": total_written_rows,
         "num_valid_labels": total_written_valid,
         "data_file": str(data_path),

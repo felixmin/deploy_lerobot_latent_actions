@@ -37,6 +37,7 @@ class LatentExportConfig:
     dataset_repo_id: str | None = None
     dataset_root: str | None = None
     episodes: list[int] | None = None
+    video_keys_to_load: list[str] | None = None
     output_dir: Path | None = None
     output_repo_id: str | None = None
     # Use a top-level namespace such as `latent_labels` or `lam_lapa`.
@@ -125,6 +126,20 @@ def _normalize_export_plan(plan: Any) -> dict[str, Any]:
         "delta_timestamps": plan["delta_timestamps"],
         "representations": representations,
     }
+
+
+def _resolve_video_keys_to_load(
+    *,
+    requested: list[str] | None,
+    plan: dict[str, Any],
+    dataset: LeRobotDataset,
+) -> list[str] | None:
+    if requested is not None:
+        return requested
+
+    video_keys = set(dataset.meta.video_keys)
+    plan_video_keys = [key for key in plan["delta_timestamps"] if key in video_keys]
+    return plan_video_keys or None
 
 
 def _normalize_export_batch(batch_out: Any) -> dict[str, Any]:
@@ -220,12 +235,18 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
     export_latent_labels = _get_required_method(policy, "export_latent_labels")
 
     plan = _normalize_export_plan(prepare_latent_export(source_dataset.meta))
+    video_keys_to_load = _resolve_video_keys_to_load(
+        requested=cfg.video_keys_to_load,
+        plan=plan,
+        dataset=source_dataset,
+    )
 
     label_dataset = LeRobotDataset(
         cfg.dataset_repo_id,
         root=cfg.dataset_root,
         episodes=cfg.episodes,
         delta_timestamps=plan["delta_timestamps"],
+        video_keys_to_load=video_keys_to_load,
     )
     dataloader = torch.utils.data.DataLoader(
         label_dataset,
@@ -266,6 +287,7 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
                 "batch_size": cfg.batch_size,
                 "num_workers": cfg.num_workers,
                 "delta_timestamps": plan["delta_timestamps"],
+                "video_keys_to_load": video_keys_to_load,
             }
         ),
     )
@@ -386,6 +408,7 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
             if np.issubdtype(np.dtype(info["dtype"]), np.floating)
         ],
         "delta_timestamps": plan["delta_timestamps"],
+        "video_keys_to_load": video_keys_to_load,
         "num_valid_labels": int(valid_supervision.sum()),
     }
     label_manifest_path = output_dir / "label_manifest.json"
@@ -423,6 +446,7 @@ def export_latent_dataset(cfg: LatentExportConfig) -> None:
             if np.issubdtype(np.dtype(info["dtype"]), np.floating)
         ],
         "delta_timestamps": plan["delta_timestamps"],
+        "video_keys_to_load": video_keys_to_load,
         "num_rows": int(source_dataset.meta.total_frames),
         "num_valid_labels": int(valid_supervision.sum()),
         "label_manifest_path": str(label_manifest_path),
